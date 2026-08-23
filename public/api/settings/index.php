@@ -39,7 +39,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (isset($data['memory_limit'])) $updates['memory_limit'] = max(128, (int)$data['memory_limit']);
     if (isset($data['chunk_size'])) $updates['chunk_size'] = max(1, (int)$data['chunk_size']);
     if (isset($data['max_uploads'])) $updates['max_uploads'] = max(1, min(10, (int)$data['max_uploads']));
-    if (isset($data['thumbnail_quality'])) $updates['thumbnail_quality'] = max(1, min(100, (int)$data['thumbnail_quality']));
+    if (isset($data['thumbnail_quality'])) $updates['thumbnail_quality'] = max(10, min(100, (int)$data['thumbnail_quality']));
     
     $newConfig = save_config($updates);
     json_response(['success' => true, 'config' => $newConfig]);

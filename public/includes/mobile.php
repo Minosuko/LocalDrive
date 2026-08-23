@@ -117,7 +117,9 @@ function mobile_initialize($requireAuthentication = true) {
     }
     $length = (int)($_SERVER['CONTENT_LENGTH'] ?? 0);
     if ($length > 0 && $length > 1024 * 1024 * 1024) mobile_error('Request body is too large', 413);
-    return $requireAuthentication ? mobile_require_principal() : null;
+    $principal = $requireAuthentication ? mobile_require_principal() : null;
+    if ($principal) $GLOBALS['clouddrive_root_principal'] = $principal;
+    return $principal;
 }
 
 function mobile_json_input($maximumBytes = 65536) {
@@ -296,7 +298,7 @@ SQL);
         return $session;
     } catch (PDOException $error) {
         if ($database->inTransaction()) $database->rollBack();
-        if ((string)$error->getCode() === '23000' || str_contains($error->getMessage(), 'UNIQUE constraint')) {
+        if ((string)$error->getCode() === '23000' || strpos($error->getMessage(), 'UNIQUE constraint') !== false) {
             mobile_error('That username is unavailable', 409);
         }
         mobile_error('Could not create account', 500);
@@ -438,14 +440,25 @@ function mobile_basic_principal($authorization = null) {
     $normalized = strtolower(trim($username));
     if (!preg_match('/^[a-z0-9._-]{3,64}$/', $normalized)) return null;
     $database = mobile_db();
+    $attemptKey = mobile_attempt_key($normalized);
+    $limit = $database->prepare('SELECT blocked_until FROM login_attempts WHERE key_hash = ?');
+    $limit->execute([$attemptKey]);
+    if ((int)($limit->fetchColumn() ?: 0) > time()) return null;
     $statement = $database->prepare("SELECT * FROM users WHERE username_norm = ? AND role = 'root' AND status = 'active'");
     $statement->execute([$normalized]);
     $user = $statement->fetch();
-    if (!$user) return null;
+    if (!$user) {
+        mobile_record_login_failure($database, $attemptKey);
+        return null;
+    }
     if (!mobile_basic_auth_cache_valid($authorization, $user)) {
-        if (!password_verify($password, $user['password_hash'])) return null;
+        if (!password_verify($password, $user['password_hash'])) {
+            mobile_record_login_failure($database, $attemptKey);
+            return null;
+        }
         mobile_remember_basic_auth($authorization, $user);
     }
+    $database->prepare('DELETE FROM login_attempts WHERE key_hash = ?')->execute([$attemptKey]);
     return [
         'session_id' => null,
         'user_id' => $user['id'],
@@ -625,6 +638,7 @@ function mobile_create_root_directories() {
 
 function mobile_prepare_root_storage($principal = null) {
     $principal = mobile_require_root($principal ?: mobile_initialize(true));
+    $GLOBALS['clouddrive_root_principal'] = $principal;
     $root = mobile_storage_root();
     if (!is_dir($root)) $root = mobile_create_root_directories();
     if (!defined('STORAGE_ROOT')) define('STORAGE_ROOT', $root);

@@ -15,6 +15,7 @@ if (!$path) error_response('No path specified');
 
 $real = get_real_path($path);
 if (!file_exists($real) || is_dir($real)) error_response('File not found', 404);
+if ((@filesize($real) ?: 0) > MAX_SOURCE_SIZE) error_response('Image is too large to preview', 413);
 
 $ext = strtolower(pathinfo($real, PATHINFO_EXTENSION));
 

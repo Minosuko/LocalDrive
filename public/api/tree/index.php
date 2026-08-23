@@ -17,7 +17,7 @@ $etagFile = $cacheFile . '.etag';
 if (file_exists($cacheFile) && time() - filemtime($cacheFile) < 120
     && hash_equals($generation, @file_get_contents($cacheVersionFile) ?: '')) {
     $cached = file_get_contents($cacheFile);
-    if ($cached !== false) send_tree_json($cached, @file_get_contents($etagFile) ?: null);
+    if ($cached !== false) send_tree_json($cached);
 }
 
 $root = rtrim(str_replace('\\', '/', STORAGE_DIR), '/');
@@ -25,6 +25,7 @@ if (!is_dir($root)) json_response(['success' => true, 'data' => ['tree' => []]])
 
 $tree = [];
 $childCounts = [];
+$scanStable = true;
 try {
     $directory = new RecursiveDirectoryIterator($root, RecursiveDirectoryIterator::SKIP_DOTS);
     $filtered = new RecursiveCallbackFilterIterator($directory, static function ($current) {
@@ -57,8 +58,12 @@ try {
             ];
         }
     }
-} catch (Exception $e) {
-    // Ignore permissions/read errors inside iterator
+} catch (Throwable $e) {
+    $scanStable = false;
+}
+
+if (!$scanStable || !hash_equals($generation, @file_get_contents($versionFile) ?: '')) {
+    error_response('Folder changed during scan', 409);
 }
 
 foreach ($tree as $path => &$entry) $entry['children_count'] = $childCounts[$path] ?? 0;
@@ -72,12 +77,15 @@ usort($tree, function($a, $b) {
 $res = ['success' => true, 'data' => ['tree' => $tree]];
 $json = json_encode($res, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
 $etag = '"tree-' . hash('sha256', $json) . '"';
-if (hash_equals($generation, @file_get_contents($versionFile) ?: '')) {
+with_cache_file_lock($cacheFile . '.lock', static function () use (
+    $versionFile, $generation, $cacheVersionFile, $cacheFile, $etagFile, $json, $etag
+) {
+    if (!hash_equals($generation, @file_get_contents($versionFile) ?: '')) return;
     @unlink($cacheVersionFile);
-    if (@atomic_write_file($cacheFile, $json) && @atomic_write_file($etagFile, $etag)) {
+    if (@atomic_write_file($cacheFile, $json)) {
         @atomic_write_file($cacheVersionFile, $generation);
     }
-}
+});
 send_tree_json($json, $etag);
 
 function send_tree_json($json, $etag = null) {

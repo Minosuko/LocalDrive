@@ -16,6 +16,7 @@ define('HQ_MAX_H', 1920);
 $cfg = get_config();
 define('THUMB_QUALITY', max(10, min(100, (int)$cfg['thumbnail_quality'])));
 define('MAX_SOURCE_SIZE', 100 * 1024 * 1024);
+define('IMAGE_MEMORY_LIMIT_BYTES', max(128, (int)($cfg['memory_limit'] ?? 128)) * 1024 * 1024);
 
 // Ensure thumbnail directories exist
 if (!is_dir(THUMBS_DIR)) @mkdir(THUMBS_DIR, 0755, true);
@@ -26,19 +27,10 @@ if (!is_dir(HQ_DIR)) @mkdir(HQ_DIR, 0755, true);
  * Tries to increase memory_limit on the fly if needed.
  */
 function ensure_memory_for_image($width, $height, $bytesPerPixel = 4) {
-    $needed = $width * $height * $bytesPerPixel * 2.5; // GD overhead
+    if ($width <= 0 || $height <= 0) return false;
+    $needed = $width * $height * max(8, $bytesPerPixel * 2);
     $current = memory_get_usage(true);
-    $limit = ini_get('memory_limit');
-    if ($limit === '-1') return true;
-    $limitBytes = (int)$limit * 1024 * 1024;
-    $available = $limitBytes - $current;
-    if ($needed > $available) {
-        $newLimit = ceil(($current + $needed + 10 * 1024 * 1024) / 1024 / 1024) . 'M';
-        @ini_set('memory_limit', $newLimit);
-        $limitBytes2 = (int)ini_get('memory_limit') * 1024 * 1024;
-        if ($limitBytes2 === $limitBytes) return false; // couldn't increase
-    }
-    return true;
+    return $needed <= max(0, IMAGE_MEMORY_LIMIT_BYTES - $current - 8 * 1024 * 1024);
 }
 
 function handle_thumbnail() {
@@ -77,6 +69,9 @@ function handle_thumbnail() {
 
     if (!in_array($type, ['image', 'video'])) {
         error_response('No thumbnail for this type', 404);
+    }
+    if ($type === 'image' && (@filesize($real) ?: 0) > MAX_SOURCE_SIZE) {
+        error_response('Image is too large to preview', 413);
     }
 
     // Select directory based on size
@@ -176,6 +171,7 @@ function publish_thumbnail_cache($cachePath, $cacheKey, callable $generator, $re
             return false;
         }
         $temporary = null;
+        if ($replace) @touch($cachePath . '.uploaded');
         @unlink($failedPath);
         return true;
     } finally {
@@ -650,7 +646,8 @@ function find_folder_thumb_images($dir) {
     foreach ($items as $item) {
         if ($item === '.' || $item === '..') continue;
         $path = $dir . DIRECTORY_SEPARATOR . $item;
-        if (is_file($path) && in_array(strtolower(pathinfo($item, PATHINFO_EXTENSION)), $imageExts, true)) {
+        if (is_file($path) && (@filesize($path) ?: 0) <= MAX_SOURCE_SIZE
+            && in_array(strtolower(pathinfo($item, PATHINFO_EXTENSION)), $imageExts, true)) {
             $images[] = $path;
             if (count($images) >= 4) break;
         }
@@ -715,8 +712,11 @@ function serve_image($path, $key = null) {
     while (ob_get_level()) ob_end_clean();
 
     $mime = known_mime_type(pathinfo($path, PATHINFO_EXTENSION)) ?: 'image/jpeg';
-    $etag = '"' . ($key ?: md5_file($path)) . '"';
-    $versioned = isset($_GET['v']) && $_GET['v'] !== '';
+    $replaceable = is_file($path . '.uploaded');
+    $etagIdentity = $key ?: md5_file($path);
+    if ($replaceable) $etagIdentity .= '-' . (@filemtime($path) ?: 0) . '-' . (@filesize($path) ?: 0);
+    $etag = '"' . $etagIdentity . '"';
+    $versioned = !$replaceable && isset($_GET['v']) && $_GET['v'] !== '';
     header('Content-Type: ' . $mime);
     header('Cache-Control: ' . ($versioned ? 'private, max-age=31536000, immutable' : 'private, no-cache'));
     header('Vary: Authorization');

@@ -5,7 +5,7 @@
 const API = '/api';
 let CHUNK_SIZE = 5 * 1024 * 1024; // Default 5MB chunks
 let MAX_UPLOADS = 3;
-let UPLOAD_CONCURRENCY = 2;
+let UPLOAD_CONCURRENCY = 1;
 let accountRedirecting = false;
 
 const nativeFetch = window.fetch.bind(window);
@@ -75,7 +75,7 @@ async function init() {
         const j = await r.json();
         const c = j.config || {};
         if (c.chunk_size) CHUNK_SIZE = c.chunk_size * 1024 * 1024;
-        if (c.max_uploads) UPLOAD_CONCURRENCY = c.max_uploads;
+        if (c.max_uploads) MAX_UPLOADS = Math.max(1, Math.min(10, Number(c.max_uploads) || 3));
     } catch (e) {}
 
     const savedPath = localStorage.getItem('cd_path') || '/';
@@ -197,13 +197,17 @@ async function loadFiles(path, silent = false) {
 
 // ── Search Logic ──
 async function performSearch(q) {
+    if (_loadAbort) _loadAbort.abort();
+    _loadAbort = new AbortController();
+    const gen = ++_loadGen;
     dom.loadingState.classList.remove('hidden');
     dom.fileList.innerHTML = '';
     dom.emptyState.classList.add('hidden');
     
     try {
-        const r = await fetch(`${API}/files/search/?q=${encodeURIComponent(q)}`);
+        const r = await fetch(`${API}/files/search/?q=${encodeURIComponent(q)}`, { signal: _loadAbort.signal });
         const j = await r.json();
+        if (gen !== _loadGen) return;
         if (!j.success) throw new Error(j.error);
         
         state.files = j.data.files || [];
@@ -214,9 +218,10 @@ async function performSearch(q) {
         
         renderFiles(true);
     } catch (e) {
+        if (e.name === 'AbortError' || gen !== _loadGen) return;
         dom.fileList.innerHTML = `<div class="state-msg"><p class="state-title">Error</p><p class="state-sub">${esc(e.message)}</p></div>`;
     } finally {
-        dom.loadingState.classList.add('hidden');
+        if (gen === _loadGen) dom.loadingState.classList.add('hidden');
     }
 }
 
@@ -1648,6 +1653,12 @@ async function processUpload(id) {
                         }
                         
                         if (xhr.status >= 200 && xhr.status < 300) {
+                            let response;
+                            try { response = JSON.parse(xhr.responseText); } catch (_) {}
+                            if (!response || Number(response.bytes_written) !== chunk.size) {
+                                reject(new Error(`Chunk ${i + 1} was incomplete`));
+                                return;
+                            }
                             u.chunks[i] = true;
                             calcProgress(u);
                             activeChunks--;

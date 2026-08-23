@@ -13,12 +13,13 @@ if (!$path) error_response('No path provided', 400);
 $real = get_real_path($path);
 if (!file_exists($real) || is_dir($real)) error_response('File not found', 404);
 
-$cacheKey = hash('sha256', implode('|', [
+$sourceSignature = [
     str_replace('\\', '/', realpath($real) ?: $real),
     @filemtime($real) ?: 0,
     @filectime($real) ?: 0,
     @filesize($real) ?: 0,
-]));
+];
+$cacheKey = hash('sha256', implode('|', $sourceSignature));
 $cachePath = CACHE_DIR . DIRECTORY_SEPARATOR . 'zip_' . $cacheKey . '.json';
 
 if (file_exists($cachePath)) {
@@ -35,6 +36,10 @@ if ($zip->open($real) === true) {
     $files = [];
     for ($i = 0; $i < $zip->numFiles; $i++) {
         $stat = $zip->statIndex($i);
+        if (!is_array($stat)) {
+            $zip->close();
+            error_response('Failed to read ZIP entry', 500);
+        }
         $files[] = [
             'name' => $stat['name'],
             'size' => $stat['size'],
@@ -42,6 +47,14 @@ if ($zip->open($real) === true) {
         ];
     }
     $zip->close();
+    clearstatcache(true, $real);
+    $currentSignature = [
+        str_replace('\\', '/', realpath($real) ?: $real),
+        @filemtime($real) ?: 0,
+        @filectime($real) ?: 0,
+        @filesize($real) ?: 0,
+    ];
+    if ($sourceSignature !== $currentSignature) error_response('ZIP changed while being read', 409);
     
     $json = json_encode(
         ['success' => true, 'data' => ['files' => $files]],

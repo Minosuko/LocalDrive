@@ -5,6 +5,12 @@
  */
 
 require_once dirname(__DIR__) . '/includes/helpers.php';
+if (!isset($GLOBALS['clouddrive_root_principal'])) {
+    require_once dirname(__DIR__) . '/includes/mobile.php';
+    $principal = mobile_request_principal(true, true);
+    if (!$principal || ($principal['role'] ?? '') !== 'root') mobile_error('Root sign-in required', 401);
+    $GLOBALS['clouddrive_root_principal'] = $principal;
+}
 
 @ini_set('max_execution_time', '0');
 @ini_set('memory_limit', max(128, (int)$cfg['memory_limit']) . 'M');

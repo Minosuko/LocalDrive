@@ -22,16 +22,18 @@ function handle_list() {
     $cacheKey = md5($base . '_' . ($only_folders ? 'folders' : 'all'));
     $cacheFile = CACHE_DIR . DIRECTORY_SEPARATOR . 'dir_' . $cacheKey . '.json';
     $etagFile = $cacheFile . '.etag';
+    $cacheVersionFile = $cacheFile . '.version';
+    $lockFile = CACHE_DIR . DIRECTORY_SEPARATOR . 'dir_' . $cacheKey . '.lock';
     $versionFile = CACHE_DIR . DIRECTORY_SEPARATOR . 'dir_' . $cacheKey . '.version';
     $cacheGeneration = @file_get_contents($versionFile) ?: '';
 
     // Serve from cache if valid and fresh (< 60s to catch external edits, or strictly rely on invalidation)
     if (($_GET['refresh'] ?? '') !== '1' && file_exists($cacheFile) && time() - filemtime($cacheFile) < 60
-        && (@filemtime($real) ?: 0) <= filemtime($cacheFile)) {
+        && (@filemtime($real) ?: 0) <= filemtime($cacheFile)
+        && hash_equals((string)$cacheGeneration, (string)(@file_get_contents($cacheVersionFile) ?: ''))) {
         $cached = file_get_contents($cacheFile);
         if ($cached !== false) {
-            $etag = @file_get_contents($etagFile) ?: null;
-            send_directory_json($cached, $etag);
+            send_directory_json($cached);
         }
     }
 
@@ -81,11 +83,16 @@ function handle_list() {
 
     $json = json_encode($res, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
     $etag = '"dir-' . hash('sha256', $json) . '"';
-    $currentGeneration = @file_get_contents($versionFile) ?: '';
-    if (hash_equals($cacheGeneration, $currentGeneration)) {
-        @unlink($etagFile);
-        if (@atomic_write_file($cacheFile, $json)) @atomic_write_file($etagFile, $etag);
-    }
+    with_cache_file_lock($lockFile, static function () use (
+        $versionFile, $cacheGeneration, $cacheVersionFile, $cacheFile, $etagFile, $json, $etag
+    ) {
+        $currentGeneration = @file_get_contents($versionFile) ?: '';
+        if (!hash_equals($cacheGeneration, $currentGeneration)) return;
+        @unlink($cacheVersionFile);
+        if (@atomic_write_file($cacheFile, $json)) {
+            @atomic_write_file($cacheVersionFile, $currentGeneration);
+        }
+    });
     send_directory_json($json, $etag);
 }
 

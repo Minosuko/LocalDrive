@@ -108,26 +108,46 @@ function format_size($bytes) {
     return round($v, 2) . ' ' . $u[$i];
 }
 
+function with_cache_file_lock($path, callable $callback) {
+    $lock = @fopen($path, 'c');
+    if (!is_resource($lock) || !@flock($lock, LOCK_EX)) {
+        if (is_resource($lock)) fclose($lock);
+        return $callback();
+    }
+    try {
+        return $callback();
+    } finally {
+        @flock($lock, LOCK_UN);
+        fclose($lock);
+    }
+}
+
 function invalidate_dir_cache($realDir) {
     $base = realpath($realDir) ?: $realDir;
     $keyAll = md5($base . '_all');
     $keyFolders = md5($base . '_folders');
     $version = bin2hex(random_bytes(12));
-    @atomic_write_file(CACHE_DIR . DIRECTORY_SEPARATOR . 'dir_' . $keyAll . '.version', $version);
-    @atomic_write_file(CACHE_DIR . DIRECTORY_SEPARATOR . 'dir_' . $keyFolders . '.version', $version);
-    @unlink(CACHE_DIR . DIRECTORY_SEPARATOR . 'dir_' . $keyAll . '.json');
-    @unlink(CACHE_DIR . DIRECTORY_SEPARATOR . 'dir_' . $keyFolders . '.json');
-    @unlink(CACHE_DIR . DIRECTORY_SEPARATOR . 'dir_' . $keyAll . '.json.etag');
-    @unlink(CACHE_DIR . DIRECTORY_SEPARATOR . 'dir_' . $keyFolders . '.json.etag');
+    foreach ([$keyAll, $keyFolders] as $key) {
+        with_cache_file_lock(CACHE_DIR . DIRECTORY_SEPARATOR . 'dir_' . $key . '.lock', static function () use ($key, $version) {
+            $cacheFile = CACHE_DIR . DIRECTORY_SEPARATOR . 'dir_' . $key . '.json';
+            @atomic_write_file(CACHE_DIR . DIRECTORY_SEPARATOR . 'dir_' . $key . '.version', $version);
+            @unlink($cacheFile);
+            @unlink($cacheFile . '.etag');
+            @unlink($cacheFile . '.version');
+        });
+    }
     $folderPrefix = CACHE_DIR . DIRECTORY_SEPARATOR . 'thumbs' . DIRECTORY_SEPARATOR . 'folder_' . md5(str_replace('\\', '/', $base));
     foreach (glob($folderPrefix . '*.jpg') ?: [] as $thumbnail) @unlink($thumbnail);
 }
 
 function invalidate_tree_cache() {
     $cacheFile = CACHE_DIR . DIRECTORY_SEPARATOR . 'tree.json';
-    @unlink($cacheFile);
-    @unlink($cacheFile . '.etag');
-    @atomic_write_file(CACHE_DIR . DIRECTORY_SEPARATOR . 'manifest.version', bin2hex(random_bytes(12)));
+    with_cache_file_lock($cacheFile . '.lock', static function () use ($cacheFile) {
+        @atomic_write_file(CACHE_DIR . DIRECTORY_SEPARATOR . 'manifest.version', bin2hex(random_bytes(12)));
+        @unlink($cacheFile);
+        @unlink($cacheFile . '.etag');
+        @unlink($cacheFile . '.version');
+    });
 }
 
 function get_dir_size($dir) {

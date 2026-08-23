@@ -34,7 +34,7 @@ if (($_GET['refresh'] ?? '') !== '1' && is_file($cacheFile) && is_file($cacheVer
     && hash_equals($cacheGeneration, $cachedGeneration) && time() - filemtime($cacheFile) < 60) {
     $cached = file_get_contents($cacheFile);
     if ($cached !== false) {
-        send_manifest_json($cached, @file_get_contents($etagFile) ?: null);
+        send_manifest_json($cached);
     }
 }
 
@@ -96,7 +96,7 @@ $etag = '"manifest-' . hash('sha256', $json) . '"';
 $currentGeneration = @file_get_contents($versionFile) ?: '';
 if (hash_equals($cacheGeneration, $currentGeneration)) {
     @unlink($cacheVersionFile);
-    if (@atomic_write_file($cacheFile, $json) && @atomic_write_file($etagFile, $etag)) {
+    if (@atomic_write_file($cacheFile, $json)) {
         @atomic_write_file($cacheVersionFile, $currentGeneration);
     }
 }
@@ -110,7 +110,10 @@ function stream_manifest_json($base, $path, $versionFile, $generation) {
     header('Content-Type: application/json; charset=utf-8');
     header('Cache-Control: private, no-cache, no-transform');
     header('Vary: Authorization');
-    echo '{"success":true,"data":{"path":' . json_encode(sanitize_path($path), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . ',"files":[';
+    echo '{"success":true,"data":{"path":' . json_encode(
+        sanitize_path($path),
+        JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE
+    ) . ',"files":[';
     $first = true;
     $stable = true;
     $count = 0;
@@ -138,8 +141,16 @@ function stream_manifest_json($base, $path, $versionFile, $generation) {
                     'modified' => $file->getMTime(),
                     'mime' => $isDirectory ? 'httpd/unix-directory' : get_metadata_mime_type($fullPath),
                 ];
+                $encoded = json_encode(
+                    $entry,
+                    JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE
+                );
+                if ($encoded === false) {
+                    $stable = false;
+                    continue;
+                }
                 if (!$first) echo ',';
-                echo json_encode($entry, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+                echo $encoded;
                 $first = false;
                 if ((++$count % 100) === 0) flush();
             } catch (Throwable $error) {

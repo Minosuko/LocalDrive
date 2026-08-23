@@ -82,7 +82,14 @@ function router_run_server()
         fwrite(STDERR, "Could not listen on $host:$port: $errorMessage ($errorNumber)\n");
         exit(1);
     }
-    $listeners = [['stream' => $httpServer, 'scheme' => 'http', 'port' => $port, 'tls' => false, 'crypto_method' => null]];
+    $listeners = [[
+        'stream' => $httpServer,
+        'scheme' => 'http',
+        'port' => $port,
+        'tls' => false,
+        'crypto_method' => null,
+        'tls_options' => null,
+    ]];
 
     if ($httpsEnabled) {
         $certificate = router_ensure_tls_certificate($config);
@@ -93,7 +100,7 @@ function router_run_server()
             if (defined('STREAM_CRYPTO_METHOD_TLSv1_3_SERVER')) {
                 $cryptoMethod |= constant('STREAM_CRYPTO_METHOD_TLSv1_3_SERVER');
             }
-            $tlsContext = stream_context_create(['ssl' => [
+            $tlsOptions = [
                 'local_cert' => $certificate['local_certificate'] ?? $certificate['certificate'],
                 'local_pk' => $certificate['private_key'],
                 'verify_peer' => false,
@@ -101,7 +108,9 @@ function router_run_server()
                 'disable_compression' => true,
                 'honor_cipher_order' => true,
                 'crypto_method' => $cryptoMethod,
-            ]]);
+                'security_level' => max(0, min(5, (int)($config['tls_security_level'] ?? 1))),
+            ];
+            $tlsContext = stream_context_create(['ssl' => $tlsOptions]);
             $tlsNumber = 0;
             $tlsMessage = '';
             $httpsServer = @stream_socket_server(
@@ -120,6 +129,7 @@ function router_run_server()
                     'port' => $httpsPort,
                     'tls' => true,
                     'crypto_method' => $cryptoMethod,
+                    'tls_options' => $tlsOptions,
                 ];
             }
         }
@@ -135,6 +145,7 @@ function router_run_server()
     }
     echo "Press Ctrl+C to stop.\n";
 
+    putenv('CLOUDDRIVE_HTTPS_ACTIVE=' . (count($listeners) > 1 ? '1' : '0'));
     $httpWorkers = router_start_http_worker_pool($workerCount, $host, $port);
     if (count($httpWorkers) !== $workerCount) {
         fwrite(STDERR, "Could not start the HTTP worker pool.\n");
@@ -266,7 +277,7 @@ function router_run_http_worker($controlAddress, $host, $port, $parentPid)
         if (in_array($server, $read, true)) {
             $client = @stream_socket_accept($server, 0);
             if ($client !== false) {
-                stream_set_timeout($client, 300);
+                stream_set_timeout($client, 10);
                 router_optimize_stream($client);
                 try {
                     router_handle_connection($client, $cgiBinary, $host, $port);
@@ -552,17 +563,24 @@ function router_run_connection_loop($listeners, $maxConnections, $httpWorkers)
         }
 
         foreach ($connections as $id => $connection) {
+            if (!empty($connection['tls_handshake'])) {
+                if (is_resource($connection['client'])) {
+                    $read[] = $connection['client'];
+                    $readMap[(int)$connection['client']] = ['handshake', $id];
+                }
+                continue;
+            }
             if (is_resource($connection['listener'])) {
                 $read[] = $connection['listener'];
                 $readMap[(int)$connection['listener']] = ['listener', $id];
             }
             if (is_resource($connection['client']) && !$connection['client_eof']
-                && is_resource($connection['worker']) && strlen($connection['to_worker']) < 32 * 1024 * 1024) {
+                && is_resource($connection['worker']) && strlen($connection['to_worker']) < 4 * 1024 * 1024) {
                 $read[] = $connection['client'];
                 $readMap[(int)$connection['client']] = ['client', $id];
             }
             if (is_resource($connection['worker']) && !$connection['worker_eof']
-                && strlen($connection['to_client']) < 32 * 1024 * 1024) {
+                && strlen($connection['to_client']) < 8 * 1024 * 1024) {
                 $read[] = $connection['worker'];
                 $readMap[(int)$connection['worker']] = ['worker', $id];
             }
@@ -577,7 +595,7 @@ function router_run_connection_loop($listeners, $maxConnections, $httpWorkers)
         }
 
         $except = null;
-        $selectTimeout = $connections ? 10000 : 100000;
+        $selectTimeout = $connections ? 1000 : 100000;
         if (@stream_select($read, $write, $except, 0, $selectTimeout) === false) {
             continue;
         }
@@ -587,21 +605,31 @@ function router_run_connection_loop($listeners, $maxConnections, $httpWorkers)
             if ($type === 'server') {
                 $listener = $listeners[$id];
                 while ($client = @stream_socket_accept($listener['stream'], 0)) {
-                    if (!empty($listener['tls'])) {
-                        stream_set_blocking($client, true);
-                        stream_set_timeout($client, 3);
-                        if (@stream_socket_enable_crypto($client, true, $listener['crypto_method']) !== true) {
-                            fclose($client);
-                            continue;
-                        }
-                    }
                     if (count($connections) >= $maxConnections) {
                         router_write_simple_response($client, 503, 'Too many connections');
                         fclose($client);
                         continue;
                     }
-                    $workerAddress = $httpWorkers[$nextWorker++ % count($httpWorkers)]['address'];
-                    $connection = router_connect_http_worker($client, $workerAddress, $listener['scheme'], $listener['port']);
+                    $remoteAddress = router_socket_remote_address($client);
+                    if (!empty($listener['tls'])) {
+                        foreach ($listener['tls_options'] as $option => $value) {
+                            stream_context_set_option($client, 'ssl', $option, $value);
+                        }
+                        stream_set_blocking($client, false);
+                        $connections[$nextId++] = [
+                            'client' => $client,
+                            'tls_handshake' => true,
+                            'crypto_method' => $listener['crypto_method'],
+                            'scheme' => $listener['scheme'],
+                            'port' => $listener['port'],
+                            'remote_address' => $remoteAddress,
+                            'started_at' => microtime(true),
+                        ];
+                        continue;
+                    }
+                    $connection = router_attach_http_worker(
+                        $client, $listener['scheme'], $listener['port'], $remoteAddress, $httpWorkers, $nextWorker
+                    );
                     if ($connection === null) {
                         router_write_simple_response($client, 500, 'Could not start connection worker');
                         fclose($client);
@@ -612,6 +640,10 @@ function router_run_connection_loop($listeners, $maxConnections, $httpWorkers)
                 continue;
             }
             if (!isset($connections[$id])) {
+                continue;
+            }
+            if ($type === 'handshake') {
+                router_progress_tls_handshake($connections, $id, $httpWorkers, $nextWorker);
                 continue;
             }
             if ($type === 'listener') {
@@ -651,6 +683,14 @@ function router_run_connection_loop($listeners, $maxConnections, $httpWorkers)
 
         foreach (array_keys($connections) as $id) {
             $connection = &$connections[$id];
+            if (!empty($connection['tls_handshake'])) {
+                if (microtime(true) - $connection['started_at'] > 3) {
+                    if (is_resource($connection['client'])) fclose($connection['client']);
+                    unset($connections[$id]);
+                }
+                unset($connection);
+                continue;
+            }
             if ($connection['client_eof'] && $connection['to_worker'] === '' && is_resource($connection['worker'])) {
                 @stream_socket_shutdown($connection['worker'], STREAM_SHUT_WR);
             }
@@ -672,7 +712,48 @@ function router_run_connection_loop($listeners, $maxConnections, $httpWorkers)
     }
 }
 
-function router_connect_http_worker($client, $address, $scheme = 'http', $port = 80)
+function router_attach_http_worker($client, $scheme, $port, $remoteAddress, $httpWorkers, &$nextWorker)
+{
+    $connection = null;
+    for ($attempt = 0; $attempt < count($httpWorkers) && $connection === null; $attempt++) {
+        $workerAddress = $httpWorkers[$nextWorker++ % count($httpWorkers)]['address'];
+        $connection = router_connect_http_worker($client, $workerAddress, $scheme, $port, $remoteAddress);
+    }
+    return $connection;
+}
+
+function router_progress_tls_handshake(&$connections, $id, $httpWorkers, &$nextWorker)
+{
+    if (!isset($connections[$id]) || empty($connections[$id]['tls_handshake'])) return;
+    $pending = $connections[$id];
+    $result = @stream_socket_enable_crypto($pending['client'], true, $pending['crypto_method']);
+    if ($result === 0) return;
+    if ($result !== true) {
+        $errors = [];
+        while ($error = openssl_error_string()) $errors[] = $error;
+        fwrite(STDERR, '[tls] Handshake failed' . ($errors ? ': ' . implode('; ', $errors) : '') . "\n");
+        fclose($pending['client']);
+        unset($connections[$id]);
+        return;
+    }
+    $connection = router_attach_http_worker(
+        $pending['client'],
+        $pending['scheme'],
+        $pending['port'],
+        $pending['remote_address'],
+        $httpWorkers,
+        $nextWorker
+    );
+    if ($connection === null) {
+        router_write_simple_response($pending['client'], 500, 'Could not start connection worker');
+        fclose($pending['client']);
+        unset($connections[$id]);
+        return;
+    }
+    $connections[$id] = $connection;
+}
+
+function router_connect_http_worker($client, $address, $scheme = 'http', $port = 80, $remoteAddress = '')
 {
     $worker = @stream_socket_client('tcp://' . $address, $errorNumber, $errorMessage, 2);
     if ($worker === false) {
@@ -687,7 +768,8 @@ function router_connect_http_worker($client, $address, $scheme = 'http', $port =
         'listener' => null,
         'worker' => $worker,
         'process' => null,
-        'to_worker' => 'CLOUDDRIVE-PROXY ' . $scheme . ' ' . (int)$port . "\r\n",
+        'to_worker' => 'CLOUDDRIVE-PROXY ' . $scheme . ' ' . (int)$port . ' '
+            . (filter_var($remoteAddress, FILTER_VALIDATE_IP) ? $remoteAddress : '127.0.0.1') . "\r\n",
         'to_client' => '',
         'client_eof' => false,
         'worker_eof' => false,
@@ -754,6 +836,19 @@ function router_optimize_stream($stream)
     if ($socket !== false && defined('SOL_TCP') && defined('TCP_NODELAY')) {
         @socket_set_option($socket, SOL_TCP, TCP_NODELAY, 1);
     }
+}
+
+function router_socket_remote_address($stream)
+{
+    $remote = is_resource($stream) ? (stream_socket_get_name($stream, true) ?: '') : '';
+    if (preg_match('/^\[([^]]+)](?::\d+)?$/', $remote, $match)) return $match[1];
+    if (filter_var($remote, FILTER_VALIDATE_IP)) return $remote;
+    $separator = strrpos($remote, ':');
+    if ($separator !== false) {
+        $candidate = substr($remote, 0, $separator);
+        if (filter_var($candidate, FILTER_VALIDATE_IP)) return $candidate;
+    }
+    return '';
 }
 
 function router_close_proxied_connection(&$connection)
@@ -856,9 +951,13 @@ function router_ensure_tls_certificate($config = null)
         $trustCertificatePath = !empty($config['tls_trust_certificate'])
             ? router_resolve_config_path((string)$config['tls_trust_certificate'])
             : $certificatePath;
+        if (!is_file($fullchainPath) || !is_file($trustCertificatePath)
+            || !router_validate_tls_leaf($certificate, $details, $fullchainPath, $trustCertificatePath, $config)) {
+            return null;
+        }
         return [
             'certificate' => $certificatePath,
-            'local_certificate' => is_file($fullchainPath) ? $fullchainPath : $certificatePath,
+            'local_certificate' => $fullchainPath,
             'private_key' => $privateKeyPath,
             'trust_certificate' => $trustCertificatePath,
         ];
@@ -1014,6 +1113,64 @@ function router_ensure_tls_certificate($config = null)
     }
 }
 
+function router_validate_tls_leaf($certificate, $details, $fullchainPath, $trustCertificatePath, $config)
+{
+    $expectedName = trim((string)($config['tls_certificate_name'] ?? ''));
+    if ($expectedName !== '' && !hash_equals($expectedName, (string)($details['subject']['CN'] ?? ''))) {
+        router_tls_failure('The configured HTTPS leaf has the wrong common name');
+        return false;
+    }
+
+    $subjectAlternativeName = (string)($details['extensions']['subjectAltName'] ?? '');
+    $actualDnsNames = [];
+    $actualIpAddresses = [];
+    foreach (preg_split('/,\s*/', $subjectAlternativeName) as $entry) {
+        if (stripos($entry, 'DNS:') === 0) $actualDnsNames[] = strtolower(trim(substr($entry, 4)));
+        if (stripos($entry, 'IP Address:') === 0) $actualIpAddresses[] = trim(substr($entry, 11));
+        elseif (stripos($entry, 'IP:') === 0) $actualIpAddresses[] = trim(substr($entry, 3));
+    }
+    foreach (($config['tls_dns_names'] ?? []) as $name) {
+        if (!in_array(strtolower(trim((string)$name)), $actualDnsNames, true)) {
+            router_tls_failure('The configured HTTPS leaf is missing a required DNS name');
+            return false;
+        }
+    }
+    $packedIpAddresses = array_values(array_filter(array_map(static function ($address) {
+        return @inet_pton($address);
+    }, $actualIpAddresses)));
+    foreach (($config['tls_ip_addresses'] ?? []) as $address) {
+        $packed = @inet_pton((string)$address);
+        if ($packed === false || !in_array($packed, $packedIpAddresses, true)) {
+            router_tls_failure('The configured HTTPS leaf is missing a required IP address');
+            return false;
+        }
+    }
+
+    $fullchain = (string)@file_get_contents($fullchainPath);
+    if (!preg_match_all('/-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----/s', $fullchain, $matches)
+        || count($matches[0]) < 2) {
+        router_tls_failure('The configured HTTPS full chain is incomplete');
+        return false;
+    }
+    $chainLeaf = @openssl_x509_read($matches[0][0]);
+    $issuer = @openssl_x509_read($matches[0][1]);
+    $trust = @openssl_x509_read('file://' . $trustCertificatePath);
+    $certificateFingerprint = $certificate ? @openssl_x509_fingerprint($certificate, 'sha256') : false;
+    $chainLeafFingerprint = $chainLeaf ? @openssl_x509_fingerprint($chainLeaf, 'sha256') : false;
+    $issuerPublicKey = $issuer ? @openssl_pkey_get_public($issuer) : false;
+    $trustPublicKey = $trust ? @openssl_pkey_get_public($trust) : false;
+    if (!$chainLeaf || !$issuer || !$trust
+        || !is_string($certificateFingerprint) || !is_string($chainLeafFingerprint)
+        || !hash_equals($certificateFingerprint, $chainLeafFingerprint)
+        || !$issuerPublicKey || !$trustPublicKey
+        || @openssl_x509_verify($certificate, $issuerPublicKey) !== 1
+        || @openssl_x509_verify($issuer, $trustPublicKey) !== 1) {
+        router_tls_failure('The configured HTTPS certificate chain is invalid');
+        return false;
+    }
+    return true;
+}
+
 function router_resolve_config_path($path)
 {
     return router_path_is_absolute($path) ? $path : __DIR__ . DIRECTORY_SEPARATOR . $path;
@@ -1133,14 +1290,17 @@ function router_handle_connection($client, $cgiBinary, $host, $port)
     if ($headerBlock === null) {
         return;
     }
+    stream_set_timeout($client, 300);
 
     $lines = preg_split('/\r?\n/', $headerBlock);
     $requestLine = array_shift($lines);
     $requestScheme = 'http';
     $requestPort = $port;
-    if (preg_match('/^CLOUDDRIVE-PROXY\s+(https?)\s+(\d+)$/', $requestLine, $proxyMatch)) {
+    $requestRemote = router_socket_remote_address($client) ?: '127.0.0.1';
+    if (preg_match('/^CLOUDDRIVE-PROXY\s+(https?)\s+(\d+)\s+(\S+)$/', $requestLine, $proxyMatch)) {
         $requestScheme = $proxyMatch[1];
         $requestPort = max(1, min(65535, (int)$proxyMatch[2]));
+        if (filter_var($proxyMatch[3], FILTER_VALIDATE_IP)) $requestRemote = $proxyMatch[3];
         $requestLine = array_shift($lines);
     }
     if (!preg_match('#^([A-Z]+)\s+(\S+)\s+HTTP/(1\.[01])$#', $requestLine, $match)) {
@@ -1166,11 +1326,15 @@ function router_handle_connection($client, $cgiBinary, $host, $port)
         fwrite($client, "HTTP/1.1 100 Continue\r\n\r\n");
     }
 
-    $hasBody = stripos($headers['transfer-encoding'] ?? '', 'chunked') !== false
-        || (int)($headers['content-length'] ?? 0) > 0;
+    $declaredLength = (int)($headers['content-length'] ?? 0);
+    if ($declaredLength < 0) {
+        router_write_simple_response($client, 400, 'Invalid Content-Length');
+        return;
+    }
+    $hasBody = stripos($headers['transfer-encoding'] ?? '', 'chunked') !== false || $declaredLength > 0;
     if (!$hasBody) {
         unset($GLOBALS['router_body_remainder']);
-        router_execute_cgi($client, $cgiBinary, $method, $requestTarget, $protocol, $headers, null, 0, $host, $requestPort, $requestScheme);
+        router_execute_cgi($client, $cgiBinary, $method, $requestTarget, $protocol, $headers, null, 0, $host, $requestPort, $requestScheme, $requestRemote);
         return;
     }
 
@@ -1181,12 +1345,18 @@ function router_handle_connection($client, $cgiBinary, $host, $port)
     }
 
     try {
-        $bodyLength = router_read_body($client, $headers, $bodyFile);
+        $config = router_load_config();
+        $maximumBodyBytes = max(1, (int)($config['max_request_body_mb'] ?? 10240)) * 1024 * 1024;
+        $bodyLength = router_read_body($client, $headers, $bodyFile, $maximumBodyBytes);
+        if ($bodyLength === -1) {
+            router_write_simple_response($client, 413, 'Request body is too large');
+            return;
+        }
         if ($bodyLength === null) {
             router_write_simple_response($client, 400, 'Invalid request body');
             return;
         }
-        router_execute_cgi($client, $cgiBinary, $method, $requestTarget, $protocol, $headers, $bodyFile, $bodyLength, $host, $requestPort, $requestScheme);
+        router_execute_cgi($client, $cgiBinary, $method, $requestTarget, $protocol, $headers, $bodyFile, $bodyLength, $host, $requestPort, $requestScheme, $requestRemote);
     } finally {
         @unlink($bodyFile);
     }
@@ -1211,7 +1381,7 @@ function router_read_headers($client)
     return $headers;
 }
 
-function router_read_body($client, $headers, $bodyFile)
+function router_read_body($client, $headers, $bodyFile, $maximumBytes)
 {
     $output = fopen($bodyFile, 'wb');
     if ($output === false) {
@@ -1235,6 +1405,10 @@ function router_read_body($client, $headers, $bodyFile)
                 }
                 break;
             }
+            if (!is_int($chunkLength) || $chunkLength < 0 || $chunkLength > $maximumBytes - $length) {
+                fclose($output);
+                return -1;
+            }
             $copied = router_copy_exact($client, $buffer, $output, $chunkLength);
             $ending = router_read_exact($client, $buffer, 2);
             if (!$copied || $ending !== "\r\n") {
@@ -1248,6 +1422,10 @@ function router_read_body($client, $headers, $bodyFile)
         if ($contentLength < 0) {
             fclose($output);
             return null;
+        }
+        if ($contentLength > $maximumBytes) {
+            fclose($output);
+            return -1;
         }
         if (!router_copy_exact($client, $buffer, $output, $contentLength)) {
             fclose($output);
@@ -1263,12 +1441,14 @@ function router_read_body($client, $headers, $bodyFile)
 function router_read_line($client, &$buffer)
 {
     while (($position = strpos($buffer, "\r\n")) === false) {
+        if (strlen($buffer) > 8192) return null;
         $chunk = fread($client, 8192);
         if ($chunk === false || $chunk === '') {
             return null;
         }
         $buffer .= $chunk;
     }
+    if ($position > 8192) return null;
     $line = substr($buffer, 0, $position);
     $buffer = substr($buffer, $position + 2);
     return $line;
@@ -1313,7 +1493,7 @@ function router_copy_exact($client, &$buffer, $output, $length)
     return true;
 }
 
-function router_execute_cgi($client, $cgiBinary, $method, $requestTarget, $protocol, $headers, $bodyFile, $bodyLength, $host, $port, $scheme = 'http')
+function router_execute_cgi($client, $cgiBinary, $method, $requestTarget, $protocol, $headers, $bodyFile, $bodyLength, $host, $port, $scheme = 'http', $remoteAddress = '')
 {
     $url = parse_url($requestTarget);
     if ($url === false || !isset($url['path'])) {
@@ -1332,20 +1512,19 @@ function router_execute_cgi($client, $cgiBinary, $method, $requestTarget, $proto
         $GLOBALS['router_application_backend'] = $backend;
     }
     if (is_array($backend)) {
-        if (router_execute_application_backend($client, $backend['address'], $method, $url, $protocol, $headers, $bodyFile, $bodyLength, $scheme, $port)) {
+        if (router_execute_application_backend($client, $backend['address'], $method, $url, $protocol, $headers, $bodyFile, $bodyLength, $scheme, $port, $remoteAddress)) {
             return;
         }
         router_stop_application_backend($backend);
         $backend = router_start_application_backend();
         $GLOBALS['router_application_backend'] = $backend;
         if (is_array($backend)
-            && router_execute_application_backend($client, $backend['address'], $method, $url, $protocol, $headers, $bodyFile, $bodyLength, $scheme, $port)) {
+            && router_execute_application_backend($client, $backend['address'], $method, $url, $protocol, $headers, $bodyFile, $bodyLength, $scheme, $port, $remoteAddress)) {
             return;
         }
     }
 
-    $remote = stream_socket_get_name($client, true) ?: '';
-    $remoteAddress = preg_replace('/:\d+$/', '', $remote);
+    if (!filter_var($remoteAddress, FILTER_VALIDATE_IP)) $remoteAddress = '127.0.0.1';
     static $baseEnvironment = null;
     if ($baseEnvironment === null) $baseEnvironment = is_array(getenv()) ? getenv() : [];
     $environment = $baseEnvironment;
@@ -1371,7 +1550,10 @@ function router_execute_cgi($client, $cgiBinary, $method, $requestTarget, $proto
     ]);
 
     foreach ($headers as $name => $value) {
-        if ($name === 'content-type' || $name === 'content-length') {
+        if (in_array($name, [
+            'content-type', 'content-length', 'x-clouddrive-remote-addr',
+            'x-clouddrive-proto', 'x-clouddrive-port',
+        ], true)) {
             continue;
         }
         $key = 'HTTP_' . strtoupper(str_replace('-', '_', $name));
@@ -1441,7 +1623,7 @@ function router_execute_cgi($client, $cgiBinary, $method, $requestTarget, $proto
     }
 }
 
-function router_execute_application_backend($client, $address, $method, $url, $protocol, $headers, $bodyFile, $bodyLength, $scheme, $port)
+function router_execute_application_backend($client, $address, $method, $url, $protocol, $headers, $bodyFile, $bodyLength, $scheme, $port, $remoteAddress)
 {
     $backend = @stream_socket_client('tcp://' . $address, $errorNumber, $errorMessage, 1);
     if ($backend === false) return false;
@@ -1458,8 +1640,7 @@ function router_execute_application_backend($client, $address, $method, $url, $p
         $request .= $name . ': ' . $value . "\r\n";
     }
     if (!isset($headers['host'])) $request .= 'host: localhost' . "\r\n";
-    $remote = stream_socket_get_name($client, true) ?: '';
-    $remoteAddress = preg_replace('/:\d+$/', '', $remote);
+    if (!filter_var($remoteAddress, FILTER_VALIDATE_IP)) $remoteAddress = '127.0.0.1';
     $request .= 'x-clouddrive-remote-addr: ' . $remoteAddress . "\r\n";
     $request .= 'x-clouddrive-proto: ' . $scheme . "\r\n";
     $request .= 'x-clouddrive-port: ' . (int)$port . "\r\n";
@@ -1648,9 +1829,10 @@ function router_dispatch_request()
         $config = router_load_config();
         $httpPort = getenv('CLOUDDRIVE_PORT');
         $httpsPort = getenv('CLOUDDRIVE_HTTPS_PORT');
+        $httpsActive = getenv('CLOUDDRIVE_HTTPS_ACTIVE');
         $payload = json_encode([
             'http_port' => (int)($httpPort !== false && $httpPort !== '' ? $httpPort : ($config['port'] ?? 8080)),
-            'https_enabled' => !empty($config['https_enabled']),
+            'https_enabled' => $httpsActive !== false ? $httpsActive === '1' : !empty($config['https_enabled']),
             'https_port' => (int)($httpsPort !== false && $httpsPort !== '' ? $httpsPort : ($config['https_port'] ?? 8443)),
             'certificate_url' => '/clouddrive.crt',
         ], JSON_UNESCAPED_SLASHES);
@@ -1682,7 +1864,7 @@ function router_dispatch_request()
     }
     $mobileApiRequest = $requestPath === '/api/mobile/v1' || strpos($requestPath, '/api/mobile/v1/') === 0;
     if (!$mobileApiRequest && !router_is_public_auth_path($requestPath)) {
-        router_require_root_access($requestPath, $requestMethod);
+        $GLOBALS['clouddrive_root_principal'] = router_require_root_access($requestPath, $requestMethod);
     }
     $davMethods = ['OPTIONS', 'PROPFIND', 'PROPPATCH', 'PUT', 'MKCOL', 'DELETE', 'MOVE', 'COPY', 'LOCK', 'UNLOCK'];
     if ($requestPath === '/' && in_array($requestMethod, $davMethods, true)) {
