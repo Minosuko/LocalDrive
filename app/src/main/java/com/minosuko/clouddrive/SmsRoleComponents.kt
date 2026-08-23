@@ -13,6 +13,7 @@ import android.os.Build
 import android.os.IBinder
 import android.provider.Telephony
 import android.telephony.SmsManager
+import android.telephony.SubscriptionManager
 import java.util.concurrent.Executors
 
 data class QueuedSms(
@@ -33,6 +34,7 @@ class SmsDeliverReceiver : BroadcastReceiver() {
                 val first = messages.first()
                 val address = first.displayOriginatingAddress ?: first.originatingAddress.orEmpty()
                 val body = messages.joinToString("") { it.displayMessageBody ?: it.messageBody.orEmpty() }
+                val subscriptionId = intent.subscriptionId()
                 val values = ContentValues().apply {
                     put(Telephony.Sms.ADDRESS, address)
                     put(Telephony.Sms.BODY, body)
@@ -43,6 +45,7 @@ class SmsDeliverReceiver : BroadcastReceiver() {
                     put(Telephony.Sms.REPLY_PATH_PRESENT, if (first.isReplyPathPresent) 1 else 0)
                     put(Telephony.Sms.READ, 0)
                     put(Telephony.Sms.SEEN, 0)
+                    subscriptionId?.let { put(Telephony.Sms.SUBSCRIPTION_ID, it) }
                 }
                 val inserted = context.contentResolver.insert(Telephony.Sms.Inbox.CONTENT_URI, values)
                     ?: error("Could not save SMS")
@@ -71,7 +74,7 @@ class MmsDeliverReceiver : BroadcastReceiver() {
         receiverExecutor.execute {
             try {
                 val data = intent.getByteArrayExtra("data") ?: error("Empty MMS delivery")
-                val subscription = intent.getIntExtra("subscription", -1).takeIf { it >= 0 }
+                val subscription = intent.subscriptionId()
                 val id = AccountStore.saveIncomingMms(
                     context,
                     data,
@@ -115,6 +118,7 @@ object SmsTransport {
         require(recipient.isNotEmpty()) { "Enter a recipient" }
         require(text.isNotEmpty()) { "Enter a message" }
         val threadId = Telephony.Threads.getOrCreateThreadId(context, recipient)
+        val subscriptionId = SmsManager.getDefaultSmsSubscriptionId().takeIf { it >= 0 }
         val values = ContentValues().apply {
             put(Telephony.Sms.ADDRESS, recipient)
             put(Telephony.Sms.BODY, text)
@@ -123,16 +127,19 @@ object SmsTransport {
             put(Telephony.Sms.SEEN, 1)
             put(Telephony.Sms.TYPE, Telephony.Sms.MESSAGE_TYPE_OUTBOX)
             put(Telephony.Sms.THREAD_ID, threadId)
+            subscriptionId?.let { put(Telephony.Sms.SUBSCRIPTION_ID, it) }
         }
         val messageUri = context.contentResolver.insert(Telephony.Sms.Outbox.CONTENT_URI, values)
             ?: error("Could not queue SMS")
         val messageId = ContentUris.parseId(messageUri)
         try {
             val manager = if (Build.VERSION.SDK_INT >= 31) {
-                context.getSystemService(SmsManager::class.java)
+                context.getSystemService(SmsManager::class.java)?.let { manager ->
+                    subscriptionId?.let(manager::createForSubscriptionId) ?: manager
+                }
             } else {
                 @Suppress("DEPRECATION")
-                SmsManager.getDefault()
+                subscriptionId?.let(SmsManager::getSmsManagerForSubscriptionId) ?: SmsManager.getDefault()
             } ?: error("SMS is unavailable on this device")
             val parts = manager.divideMessage(text)
             if (parts.size <= 1) {
@@ -209,3 +216,10 @@ internal const val EXTRA_MESSAGE_ID = "message_id"
 private const val EXTRA_PART_INDEX = "part_index"
 private const val EXTRA_PART_COUNT = "part_count"
 private val receiverExecutor = Executors.newSingleThreadExecutor()
+
+private fun Intent.subscriptionId(): Int? {
+    val invalid = SubscriptionManager.INVALID_SUBSCRIPTION_ID
+    return getIntExtra(SubscriptionManager.EXTRA_SUBSCRIPTION_INDEX, invalid)
+        .takeIf { it >= 0 }
+        ?: getIntExtra("subscription", invalid).takeIf { it >= 0 }
+}

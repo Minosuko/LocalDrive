@@ -762,17 +762,21 @@ class MediaSyncWorker(
             val type = row[Telephony.Sms.TYPE]?.toString()?.toIntOrNull() ?: 0
             val address = row[Telephony.Sms.ADDRESS]?.toString()
             val body = row[Telephony.Sms.BODY]?.toString()
+            val hasSubscription = row.containsKey(Telephony.Sms.SUBSCRIPTION_ID)
+            val subscriptionId = row[Telephony.Sms.SUBSCRIPTION_ID]?.toString()?.toIntOrNull()
             val smsSelection = buildString {
                 append("${Telephony.Sms.DATE}=? AND ${Telephony.Sms.TYPE}=?")
                 append(if (address == null) " AND ${Telephony.Sms.ADDRESS} IS NULL" else " AND ${Telephony.Sms.ADDRESS}=?")
                 append(if (body == null) " AND ${Telephony.Sms.BODY} IS NULL" else " AND ${Telephony.Sms.BODY}=?")
+                if (hasSubscription) append(if (subscriptionId == null) " AND ${Telephony.Sms.SUBSCRIPTION_ID} IS NULL" else " AND ${Telephony.Sms.SUBSCRIPTION_ID}=?")
             }
             val smsArgs = buildList {
                 add(date.toString()); add(type.toString())
                 if (address != null) add(address)
                 if (body != null) add(body)
+                if (hasSubscription && subscriptionId != null) add(subscriptionId.toString())
             }.toTypedArray()
-            val identity = "$date|$type|${address.orEmpty()}|${body.orEmpty()}"
+            val identity = "$date|$type|${address.orEmpty()}|${body.orEmpty()}|${if (hasSubscription) subscriptionId else "legacy"}"
             val occurrence = occurrences.merge(identity, 1, Int::plus) ?: 1
             val existing = existingCounts.getOrPut(identity) { providerRowCount(Telephony.Sms.CONTENT_URI, smsSelection, smsArgs) }
             if (existing >= occurrence) return@forEachNamedRow
@@ -784,6 +788,7 @@ class MediaSyncWorker(
                 putNullable(Telephony.Sms.BODY, body)
                 putValue(this, Telephony.Sms.READ, row[Telephony.Sms.READ])
                 putValue(this, Telephony.Sms.SEEN, row[Telephony.Sms.SEEN])
+                if (hasSubscription) putValue(this, Telephony.Sms.SUBSCRIPTION_ID, subscriptionId)
             }
             applicationContext.contentResolver.insert(Telephony.Sms.CONTENT_URI, values) ?: error("Cannot restore SMS")
         }
@@ -894,7 +899,7 @@ class MediaSyncWorker(
                         writer,
                         "messages",
                         Telephony.Sms.CONTENT_URI,
-                        arrayOf(Telephony.Sms._ID, Telephony.Sms.ADDRESS, Telephony.Sms.DATE, Telephony.Sms.DATE_SENT, Telephony.Sms.TYPE, Telephony.Sms.BODY, Telephony.Sms.READ, Telephony.Sms.SEEN, Telephony.Sms.THREAD_ID),
+                        arrayOf(Telephony.Sms._ID, Telephony.Sms.ADDRESS, Telephony.Sms.DATE, Telephony.Sms.DATE_SENT, Telephony.Sms.TYPE, Telephony.Sms.BODY, Telephony.Sms.READ, Telephony.Sms.SEEN, Telephony.Sms.THREAD_ID, Telephony.Sms.SUBSCRIPTION_ID),
                         "${Telephony.Sms._ID} ASC",
                     )
                     SyncCategory.CallHistory -> writeRows(

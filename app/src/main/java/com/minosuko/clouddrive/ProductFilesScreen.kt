@@ -503,6 +503,7 @@ fun ProductFilesScreen() {
             dismissButton = { OutlinedButton(onClick = { deleteEntry = null }) { Text("Cancel") } },
         )
     }
+    state.imageViewer?.let { ImageGalleryViewer(it, thumbnailLoader, model::closeViewer) }
     state.viewer?.let { MediaViewer(it, thumbnailLoader, model::closeViewer) }
 }
 

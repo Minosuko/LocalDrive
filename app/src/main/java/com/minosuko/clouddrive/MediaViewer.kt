@@ -2,15 +2,22 @@ package com.minosuko.clouddrive
 
 import android.net.Uri
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.MusicNote
@@ -67,6 +74,11 @@ data class ViewerContent(
     val requestHeaders: Map<String, String> = emptyMap(),
 )
 
+data class ImageGalleryContent(
+    val images: List<ViewerContent>,
+    val initialIndex: Int,
+)
+
 @Composable
 fun MediaViewer(content: ViewerContent, imageLoader: ImageLoader, onClose: () -> Unit) {
     BackHandler(onBack = onClose)
@@ -97,8 +109,56 @@ fun MediaViewer(content: ViewerContent, imageLoader: ImageLoader, onClose: () ->
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ZoomableImage(content: ViewerContent, imageLoader: ImageLoader) {
+fun ImageGalleryViewer(gallery: ImageGalleryContent, imageLoader: ImageLoader, onClose: () -> Unit) {
+    if (gallery.images.isEmpty()) return
+    val initialPage = gallery.initialIndex.coerceIn(gallery.images.indices)
+    val pager = rememberPagerState(initialPage = initialPage, pageCount = gallery.images::size)
+    val current = gallery.images[pager.currentPage]
+    var controlsVisible by remember { mutableStateOf(true) }
+    BackHandler(onBack = onClose)
+    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Surface(Modifier.fillMaxSize(), color = Color.Black) {
+            Box(Modifier.fillMaxSize()) {
+                HorizontalPager(
+                    state = pager,
+                    modifier = Modifier.fillMaxSize(),
+                    beyondViewportPageCount = 1,
+                    key = { page -> "${gallery.images[page].uri}:$page" },
+                ) { page ->
+                    ZoomableImage(gallery.images[page], imageLoader) { controlsVisible = !controlsVisible }
+                }
+                if (controlsVisible) {
+                    Row(
+                        Modifier.align(Alignment.TopCenter).fillMaxWidth().background(Color.Black.copy(alpha = .52f)).padding(start = 14.dp, top = 8.dp, end = 8.dp, bottom = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                current.title,
+                                color = Color.White,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Medium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                "${pager.currentPage + 1} of ${gallery.images.size}",
+                                color = Color.White.copy(alpha = .72f),
+                                fontSize = 11.sp,
+                            )
+                        }
+                        IconButton(onClick = onClose) { Icon(Icons.Outlined.Close, "Close", tint = Color.White) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ZoomableImage(content: ViewerContent, imageLoader: ImageLoader, onTap: () -> Unit = {}) {
     val context = androidx.compose.ui.platform.LocalContext.current
     var scale by remember(content.uri) { mutableStateOf(1f) }
     var offset by remember(content.uri) { mutableStateOf(Offset.Zero) }
@@ -124,10 +184,44 @@ private fun ZoomableImage(content: ViewerContent, imageLoader: ImageLoader) {
             .fillMaxSize()
             .background(Color.Black)
             .pointerInput(content.uri) {
-                detectTransformGestures { _, pan, zoom, _ ->
-                    val nextScale = (scale * zoom).coerceIn(1f, 6f)
-                    scale = nextScale
-                    offset = if (nextScale == 1f) Offset.Zero else offset + pan
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false)
+                    var totalMovement = Offset.Zero
+                    var usedMultiplePointers = false
+                    var changedScale = false
+                    var stillPressed: Boolean
+                    do {
+                        val event = awaitPointerEvent()
+                        val pressedPointers = event.changes.count { it.pressed }
+                        val zoom = event.calculateZoom()
+                        val pan = event.calculatePan()
+                        event.changes.firstOrNull()?.let { change ->
+                            totalMovement += change.position - change.previousPosition
+                        }
+                        if (pressedPointers > 1) usedMultiplePointers = true
+                        if (zoom != 1f) changedScale = true
+
+                        if (pressedPointers > 1 || scale > 1.001f || zoom != 1f) {
+                            val nextScale = (scale * zoom).coerceIn(1f, 7f)
+                            val maxX = size.width * (nextScale - 1f) / 2f
+                            val maxY = size.height * (nextScale - 1f) / 2f
+                            scale = nextScale
+                            offset = if (nextScale <= 1.001f) {
+                                Offset.Zero
+                            } else {
+                                Offset(
+                                    (offset.x + pan.x).coerceIn(-maxX, maxX),
+                                    (offset.y + pan.y).coerceIn(-maxY, maxY),
+                                )
+                            }
+                            event.changes.forEach { it.consume() }
+                        }
+                        stillPressed = event.changes.any { it.pressed }
+                    } while (stillPressed)
+
+                    if (!usedMultiplePointers && !changedScale && totalMovement.getDistance() < viewConfiguration.touchSlop) {
+                        onTap()
+                    }
                 }
             }
             .graphicsLayer {

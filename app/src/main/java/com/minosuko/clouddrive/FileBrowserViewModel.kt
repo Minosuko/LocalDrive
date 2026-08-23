@@ -42,6 +42,7 @@ data class FileBrowserState(
     val layout: FileLayout = FileLayout.List,
     val clipboard: FileClipboard? = null,
     val viewer: ViewerContent? = null,
+    val imageViewer: ImageGalleryContent? = null,
 ) {
     val visibleItems: List<BrowserEntry>
         get() {
@@ -136,6 +137,7 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
                         items = if (active) emptyList() else state.items,
                         clipboard = state.clipboard?.takeUnless { it.entry.driveProfileId == drive.id },
                         viewer = null,
+                        imageViewer = null,
                         operationRunning = false,
                         error = null,
                         message = "${session.displayName} signed in to ${drive.name}",
@@ -163,6 +165,8 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
                 cloudPath = if (disconnectedActive) emptyList() else state.cloudPath,
                 items = if (disconnectedActive) emptyList() else state.items,
                 clipboard = state.clipboard?.takeUnless { it.entry.driveProfileId == id },
+                viewer = null,
+                imageViewer = null,
                 message = "${profile.name} disconnected",
             )
         }
@@ -172,7 +176,7 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
     fun setSource(source: BrowserSource) {
         if (mutableState.value.source == source) return
         prefetchJob?.cancel()
-        mutableState.update { it.copy(source = source, items = emptyList(), error = null) }
+        mutableState.update { it.copy(source = source, items = emptyList(), viewer = null, imageViewer = null, error = null) }
         refresh()
     }
 
@@ -185,15 +189,29 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
         prefetchJob?.cancel()
         if (entry.isDirectory) {
             mutableState.update {
-                if (entry.driveRoot) it.copy(activeDriveId = entry.driveProfileId, cloudPath = emptyList(), items = emptyList(), query = "")
-                else if (entry.source == BrowserSource.CloudDrive) it.copy(cloudPath = entry.cloudSegments, items = emptyList(), query = "")
-                else it.copy(deviceStack = it.deviceStack + requireNotNull(entry.devicePath), items = emptyList(), query = "")
+                if (entry.driveRoot) it.copy(activeDriveId = entry.driveProfileId, cloudPath = emptyList(), items = emptyList(), query = "", viewer = null, imageViewer = null)
+                else if (entry.source == BrowserSource.CloudDrive) it.copy(cloudPath = entry.cloudSegments, items = emptyList(), query = "", viewer = null, imageViewer = null)
+                else it.copy(deviceStack = it.deviceStack + requireNotNull(entry.devicePath), items = emptyList(), query = "", viewer = null, imageViewer = null)
             }
             refresh()
         } else {
+            val current = mutableState.value
             val viewer = createViewer(entry)
+            val gallery = if (viewer?.kind == ViewerKind.Image) {
+                val images = current.visibleItems.mapNotNull { candidate ->
+                    createViewer(candidate)?.takeIf { it.kind == ViewerKind.Image }
+                }
+                ImageGalleryContent(
+                    images = images,
+                    initialIndex = images.indexOfFirst { it.uri == viewer.uri && it.title == viewer.title }.coerceAtLeast(0),
+                )
+            } else null
             mutableState.update {
-                it.copy(viewer = viewer, message = if (viewer == null) "No viewer for this file type" else null)
+                it.copy(
+                    viewer = viewer?.takeUnless { content -> content.kind == ViewerKind.Image },
+                    imageViewer = gallery,
+                    message = if (viewer == null) "No viewer for this file type" else null,
+                )
             }
         }
     }
@@ -201,9 +219,9 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
     fun up() {
         prefetchJob?.cancel()
         mutableState.update {
-            if (it.source == BrowserSource.CloudDrive && it.cloudPath.isEmpty()) it.copy(activeDriveId = null, items = emptyList(), query = "")
-            else if (it.source == BrowserSource.CloudDrive) it.copy(cloudPath = it.cloudPath.dropLast(1), items = emptyList(), query = "")
-            else it.copy(deviceStack = it.deviceStack.dropLast(1), items = emptyList(), query = "")
+            if (it.source == BrowserSource.CloudDrive && it.cloudPath.isEmpty()) it.copy(activeDriveId = null, items = emptyList(), query = "", viewer = null, imageViewer = null)
+            else if (it.source == BrowserSource.CloudDrive) it.copy(cloudPath = it.cloudPath.dropLast(1), items = emptyList(), query = "", viewer = null, imageViewer = null)
+            else it.copy(deviceStack = it.deviceStack.dropLast(1), items = emptyList(), query = "", viewer = null, imageViewer = null)
         }
         refresh()
     }
@@ -352,7 +370,7 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
     fun toggleLayout() = mutableState.update {
         it.copy(layout = if (it.layout == FileLayout.List) FileLayout.Grid else FileLayout.List)
     }
-    fun closeViewer() = mutableState.update { it.copy(viewer = null) }
+    fun closeViewer() = mutableState.update { it.copy(viewer = null, imageViewer = null) }
     fun consumeMessage() = mutableState.update { it.copy(message = null) }
 
     private fun operation(successMessage: String, block: suspend () -> Unit) {
@@ -630,7 +648,7 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
         val current = mutableState.value
         if (current.source != BrowserSource.CloudDrive || current.locationKey() != requestedLocation) return
         val drive = current.drives.firstOrNull { it.id == current.activeDriveId } ?: return
-        if (current.operationRunning || current.viewer != null) return
+        if (current.operationRunning || current.viewer != null || current.imageViewer != null) return
         val directories = items.asSequence().filter { it.isDirectory && !it.driveRoot }.take(4).toList()
         prefetchJob?.cancel()
         prefetchJob = viewModelScope.launch(Dispatchers.IO) {

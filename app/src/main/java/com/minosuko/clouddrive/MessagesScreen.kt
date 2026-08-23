@@ -10,6 +10,7 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.Telephony
 import android.telephony.PhoneNumberUtils
+import android.telephony.SubscriptionManager
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -32,6 +33,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -42,8 +44,11 @@ import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.outlined.AddComment
 import androidx.compose.material.icons.outlined.ChatBubbleOutline
+import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Mms
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material.icons.outlined.SimCard
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -96,6 +101,7 @@ data class SmsConversation(
     val snippet: String,
     val date: Long,
     val unread: Int,
+    val subscriptionId: Int?,
 )
 
 data class SmsRecord(
@@ -107,17 +113,26 @@ data class SmsRecord(
     val type: Int,
     val read: Boolean,
     val status: Int,
+    val subscriptionId: Int?,
 ) {
     val outgoing: Boolean get() = type != Telephony.Sms.MESSAGE_TYPE_INBOX
 }
 
 data class MessagesState(
     val conversations: List<SmsConversation> = emptyList(),
+    val allMessages: List<SmsRecord> = emptyList(),
     val messages: List<SmsRecord> = emptyList(),
     val pendingMms: List<IncomingMms> = emptyList(),
     val loading: Boolean = false,
     val sending: Boolean = false,
     val error: String? = null,
+)
+
+private data class MessagesSnapshot(
+    val conversations: List<SmsConversation>,
+    val allMessages: List<SmsRecord>,
+    val selectedMessages: List<SmsRecord>,
+    val pendingMms: List<IncomingMms>,
 )
 
 class MessagesViewModel(application: Application) : AndroidViewModel(application) {
@@ -147,7 +162,7 @@ class MessagesViewModel(application: Application) : AndroidViewModel(application
             mutableState.update { it.copy(loading = it.conversations.isEmpty(), error = null) }
             runCatching {
                 withContext(Dispatchers.IO) {
-                    val all = queryMessages(null)
+                    val all = queryMessages()
                     val conversations = all.groupBy(SmsRecord::threadId).mapNotNull { (thread, messages) ->
                         val newest = messages.maxByOrNull(SmsRecord::date) ?: return@mapNotNull null
                         SmsConversation(
@@ -156,15 +171,25 @@ class MessagesViewModel(application: Application) : AndroidViewModel(application
                             snippet = newest.body,
                             date = newest.date,
                             unread = messages.count { it.type == Telephony.Sms.MESSAGE_TYPE_INBOX && !it.read },
+                            subscriptionId = newest.subscriptionId,
                         )
                     }.sortedByDescending(SmsConversation::date)
-                    val selected = requestedThread?.let { queryMessages(it).sortedBy(SmsRecord::date) }.orEmpty()
-                    Triple(conversations, selected, AccountStore.incomingMms(context))
+                    val selected = requestedThread?.let { thread ->
+                        all.filter { it.threadId == thread }.sortedBy(SmsRecord::date)
+                    }.orEmpty()
+                    MessagesSnapshot(conversations, all, selected, AccountStore.incomingMms(context))
                 }
-            }.onSuccess { (conversations, messages, mms) ->
+            }.onSuccess { (conversations, allMessages, messages, mms) ->
                 if (version != refreshVersion || requestedThread != selectedThread) return@onSuccess
                 mutableState.update {
-                    it.copy(conversations = conversations, messages = messages, pendingMms = mms, loading = false, error = null)
+                    it.copy(
+                        conversations = conversations,
+                        allMessages = allMessages,
+                        messages = messages,
+                        pendingMms = mms,
+                        loading = false,
+                        error = null,
+                    )
                 }
             }.onFailure { error ->
                 if (version != refreshVersion || requestedThread != selectedThread) return@onFailure
@@ -207,9 +232,7 @@ class MessagesViewModel(application: Application) : AndroidViewModel(application
         refresh()
     }
 
-    private fun queryMessages(threadId: Long?): List<SmsRecord> {
-        val selection = threadId?.let { "${Telephony.Sms.THREAD_ID} = ?" }
-        val arguments = threadId?.let { arrayOf(it.toString()) }
+    private fun queryMessages(): List<SmsRecord> {
         val output = mutableListOf<SmsRecord>()
         context.contentResolver.query(
             Telephony.Sms.CONTENT_URI,
@@ -222,9 +245,10 @@ class MessagesViewModel(application: Application) : AndroidViewModel(application
                 Telephony.Sms.TYPE,
                 Telephony.Sms.READ,
                 Telephony.Sms.STATUS,
+                Telephony.Sms.SUBSCRIPTION_ID,
             ),
-            selection,
-            arguments,
+            null,
+            null,
             "${Telephony.Sms.DATE} DESC",
         )?.use { cursor ->
             while (cursor.moveToNext()) {
@@ -237,6 +261,7 @@ class MessagesViewModel(application: Application) : AndroidViewModel(application
                     type = cursor.getInt(5),
                     read = cursor.getInt(6) != 0,
                     status = cursor.getInt(7),
+                    subscriptionId = if (cursor.isNull(8)) null else cursor.getInt(8).takeIf { it >= 0 },
                 )
             }
         }
@@ -257,6 +282,7 @@ fun MessagesScreen(initialAddress: String? = null, initialBody: String? = null) 
     var permissionVersion by remember { mutableStateOf(0) }
     var selectedThread by rememberSaveable { mutableStateOf<Long?>(null) }
     var composeAddress by rememberSaveable { mutableStateOf<String?>(null) }
+    var searchQuery by rememberSaveable { mutableStateOf("") }
     val roleLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
         permissionVersion++
         model.refresh()
@@ -345,6 +371,8 @@ fun MessagesScreen(initialAddress: String? = null, initialBody: String? = null) 
             } else {
                 ConversationList(
                     state = state,
+                    query = searchQuery,
+                    onQueryChanged = { searchQuery = it },
                     onRefresh = model::refresh,
                     onNew = { composeAddress = "" },
                     onOpen = {
@@ -361,11 +389,17 @@ fun MessagesScreen(initialAddress: String? = null, initialBody: String? = null) 
 @Composable
 private fun ConversationList(
     state: MessagesState,
+    query: String,
+    onQueryChanged: (String) -> Unit,
     onRefresh: () -> Unit,
     onNew: () -> Unit,
     onOpen: (SmsConversation) -> Unit,
     onMmsRead: (Long) -> Unit,
 ) {
+    val conversations = remember(state.conversations, state.allMessages, query) {
+        filteredConversations(state.conversations, state.allMessages, query)
+    }
+    val pendingMms = remember(state.pendingMms, query) { filteredMms(state.pendingMms, query) }
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
             Row(
@@ -378,6 +412,18 @@ private fun ConversationList(
                 }
                 IconButton(onClick = onRefresh) { Icon(Icons.Outlined.Refresh, "Refresh messages") }
             }
+            OutlinedTextField(
+                value = query,
+                onValueChange = onQueryChanged,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                placeholder = { Text("Search messages") },
+                leadingIcon = { Icon(Icons.Outlined.Search, null) },
+                trailingIcon = if (query.isNotEmpty()) {
+                    { IconButton(onClick = { onQueryChanged("") }) { Icon(Icons.Outlined.Close, "Clear search") } }
+                } else null,
+                singleLine = true,
+                shape = RoundedCornerShape(16.dp),
+            )
             when {
                 state.loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
                 state.conversations.isEmpty() && state.pendingMms.isEmpty() -> MessagesPermissionState(
@@ -386,12 +432,17 @@ private fun ConversationList(
                     "New message",
                     onNew,
                 )
+                conversations.isEmpty() && pendingMms.isEmpty() -> MessagesPermissionState(
+                    "No matching messages",
+                    "Try a phone number or words from the conversation.",
+                    "Clear search",
+                ) { onQueryChanged("") }
                 else -> LazyColumn(
                     modifier = Modifier.fillMaxSize(),
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 10.dp, end = 10.dp, bottom = 92.dp),
                     verticalArrangement = Arrangement.spacedBy(7.dp),
                 ) {
-                    items(state.pendingMms, key = { "mms:${it.id}" }) { mms ->
+                    items(pendingMms, key = { "mms:${it.id}" }) { mms ->
                         Card(
                             onClick = { onMmsRead(mms.id) },
                             colors = CardDefaults.cardColors(containerColor = if (mms.read) MaterialTheme.colorScheme.surface else MaterialTheme.colorScheme.secondaryContainer),
@@ -403,11 +454,14 @@ private fun ConversationList(
                                     Text("Multimedia message", fontWeight = FontWeight.SemiBold)
                                     Text(mms.status, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)
                                 }
-                                Text(formatConversationTime(mms.receivedAt), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Column(horizontalAlignment = Alignment.End) {
+                                    SimBadge(mms.subscriptionId, MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Text(formatConversationTime(mms.receivedAt), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
                             }
                         }
                     }
-                    items(state.conversations, key = SmsConversation::threadId) { conversation ->
+                    items(conversations, key = SmsConversation::threadId) { conversation ->
                         Card(
                             onClick = { onOpen(conversation) },
                             colors = CardDefaults.cardColors(containerColor = if (conversation.unread > 0) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface),
@@ -421,6 +475,8 @@ private fun ConversationList(
                                 Column(Modifier.weight(1f)) {
                                     Row(verticalAlignment = Alignment.CenterVertically) {
                                         Text(conversation.address, Modifier.weight(1f), fontWeight = if (conversation.unread > 0) FontWeight.Bold else FontWeight.SemiBold, maxLines = 1)
+                                        SimBadge(conversation.subscriptionId, MaterialTheme.colorScheme.onSurfaceVariant)
+                                        Spacer(Modifier.width(5.dp))
                                         Text(formatConversationTime(conversation.date), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                     }
                                     Text(conversation.snippet, maxLines = 1, overflow = TextOverflow.Ellipsis, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp)
@@ -497,12 +553,13 @@ private fun ConversationScreen(
                     ) {
                         Column(Modifier.padding(horizontal = 13.dp, vertical = 9.dp)) {
                             Text(message.body, color = if (message.outgoing) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant)
-                            Text(
-                                formatMessageTime(message.date),
-                                color = if (message.outgoing) MaterialTheme.colorScheme.onPrimary.copy(alpha = .72f) else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .72f),
-                                fontSize = 10.sp,
-                                modifier = Modifier.align(Alignment.End),
-                            )
+                            val detailColor = if (message.outgoing) MaterialTheme.colorScheme.onPrimary.copy(alpha = .72f)
+                                else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .72f)
+                            Row(Modifier.align(Alignment.End), verticalAlignment = Alignment.CenterVertically) {
+                                SimBadge(message.subscriptionId, detailColor)
+                                Spacer(Modifier.width(5.dp))
+                                Text(formatMessageTime(message.date), color = detailColor, fontSize = 10.sp)
+                            }
                         }
                     }
                 }
@@ -566,6 +623,55 @@ private fun addressesMatch(context: Context, existing: String, candidate: String
     @Suppress("DEPRECATION")
     return PhoneNumberUtils.compare(context, existing, candidate)
 }
+
+private fun filteredConversations(
+    conversations: List<SmsConversation>,
+    messages: List<SmsRecord>,
+    query: String,
+): List<SmsConversation> {
+    val term = query.trim()
+    if (term.isEmpty()) return conversations
+    val normalized = PhoneNumberUtils.normalizeNumber(term).takeIf { term.any(Char::isDigit) }.orEmpty()
+    val matchingThreads = messages.asSequence()
+        .filter { it.body.contains(term, ignoreCase = true) || addressMatchesSearch(it.address, term, normalized) }
+        .map(SmsRecord::threadId)
+        .toHashSet()
+    return conversations.filter {
+        it.threadId in matchingThreads || it.snippet.contains(term, ignoreCase = true) ||
+            addressMatchesSearch(it.address, term, normalized)
+    }
+}
+
+private fun filteredMms(messages: List<IncomingMms>, query: String): List<IncomingMms> {
+    val term = query.trim()
+    if (term.isEmpty()) return messages
+    return messages.filter { message ->
+        "Multimedia message".contains(term, ignoreCase = true) ||
+            message.status.contains(term, ignoreCase = true) ||
+            simLabel(message.subscriptionId).contains(term, ignoreCase = true)
+    }
+}
+
+private fun addressMatchesSearch(address: String, term: String, normalizedTerm: String): Boolean =
+    address.contains(term, ignoreCase = true) || (normalizedTerm.isNotEmpty() && PhoneNumberUtils.normalizeNumber(address).contains(normalizedTerm))
+
+@Composable
+private fun SimBadge(subscriptionId: Int?, color: androidx.compose.ui.graphics.Color) {
+    val label = remember(subscriptionId) { simLabel(subscriptionId) }
+    if (label.isEmpty()) return
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Icon(Icons.Outlined.SimCard, null, Modifier.size(12.dp), tint = color)
+        Spacer(Modifier.width(2.dp))
+        Text(label, color = color, fontSize = 9.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+private fun simLabel(subscriptionId: Int?): String {
+    if (subscriptionId == null || subscriptionId < 0) return ""
+    val slot = runCatching { SubscriptionManager.getSlotIndex(subscriptionId) }.getOrDefault(-1)
+    return if (slot >= 0) "SIM ${slot + 1}" else ""
+}
+
 private val conversationTime = DateTimeFormatter.ofPattern("MMM d")
 private val messageTime = DateTimeFormatter.ofPattern("h:mm a")
 
