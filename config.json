@@ -1,0 +1,23 @@
+{
+    "host": "0.0.0.0",
+    "port": 8080,
+    "https_enabled": true,
+    "https_port": 8443,
+    "tls_certificate_name": "CloudDrive LocalSigned",
+    "tls_dns_names": ["localhost"],
+    "tls_ip_addresses": ["127.0.0.1", "::1", "192.168.1.9", "192.168.1.65", "192.168.1.66", "192.168.1.67"],
+    "tls_certificate": "storage/system/tls/clouddrive.crt",
+    "tls_private_key": "storage/system/tls/clouddrive.key",
+    "tls_fullchain": "storage/system/tls/clouddrive-fullchain.pem",
+    "tls_trust_certificate": "FoxyCABundle/root-ca.crt",
+    "max_connections": 32,
+    "workers": 4,
+    "media_device": true,
+    "network_drive": true,
+    "friendly_name": "CloudDrive",
+    "buffer_size": 8192,
+    "memory_limit": 128,
+    "chunk_size": 16,
+    "max_uploads": 3,
+    "thumbnail_quality": 80
+}

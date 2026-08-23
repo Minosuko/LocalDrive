@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'">
+    <title>CloudDrive Root Account</title>
+    <link rel="stylesheet" href="assets/style.css?v=2">
+</head>
+<body class="account-page">
+    <main class="account-shell">
+        <header class="account-header">
+            <a href="/" class="logo account-logo" aria-label="Open CloudDrive">
+                <svg viewBox="0 0 24 24" width="28" height="28" fill="currentColor" aria-hidden="true"><path d="M19.35 10.04A7.49 7.49 0 0 0 5.25 8.5 5.994 5.994 0 0 0 6 20h13a5 5 0 0 0 .35-9.96z"/></svg>
+                <span>CloudDrive</span>
+            </a>
+            <div id="session-actions" class="account-session hidden">
+                <span id="root-label" class="account-session-label"></span>
+                <a class="btn btn-outline" href="/">Open files</a>
+                <button id="logout" class="btn btn-outline" type="button">Sign out</button>
+            </div>
+        </header>
+
+        <section id="auth-view" class="account-auth-layout">
+            <div class="account-intro">
+                <span class="account-eyebrow">PRIVATE CLOUD ACCESS</span>
+                <h1>One CloudDrive.<br>One root owner.</h1>
+                <p>The root account is required for the web app, Network Drive, Media Device, and Android access.</p>
+                <div class="account-access-list" aria-label="Protected interfaces">
+                    <span>Web files</span>
+                    <span>Network Drive</span>
+                    <span>Media Device</span>
+                    <span>Mobile API</span>
+                </div>
+            </div>
+
+            <form id="auth-form" class="account-panel account-auth-panel">
+                <div>
+                    <span id="auth-kicker" class="account-eyebrow">ROOT SIGN IN</span>
+                    <h2 id="auth-title">Unlock this CloudDrive</h2>
+                    <p class="account-muted">Use the same root credentials on every CloudDrive interface.</p>
+                </div>
+                <label class="account-field">Username<input id="auth-username" required minlength="3" maxlength="64" autocomplete="username"></label>
+                <label class="account-field">Password<input id="auth-password" type="password" required minlength="10" maxlength="128" autocomplete="current-password"></label>
+                <p id="auth-error" class="account-error hidden" role="alert"></p>
+                <button id="auth-submit" class="btn btn-primary account-submit" type="submit">Sign in as root</button>
+                <button id="bootstrap-toggle" class="account-text-button" type="button">First-time setup: create root</button>
+            </form>
+        </section>
+
+        <section id="account-view" class="account-console hidden">
+            <div class="account-console-heading">
+                <div>
+                    <span class="account-eyebrow">ROOT ACCOUNT</span>
+                    <h1>Owner settings</h1>
+                    <p>These credentials protect every way into this CloudDrive.</p>
+                </div>
+            </div>
+
+            <div class="account-card-grid">
+                <article class="account-panel account-owner-card">
+                    <div class="account-avatar" id="owner-avatar">R</div>
+                    <div>
+                        <span class="account-muted">Root owner</span>
+                        <h2 id="owner-name">Root</h2>
+                        <p id="owner-username">@root</p>
+                        <p id="owner-last-login" class="account-muted"></p>
+                    </div>
+                </article>
+
+                <article class="account-panel">
+                    <span class="account-eyebrow">CONNECTED ACCESS</span>
+                    <h2>Use root credentials</h2>
+                    <dl class="account-endpoints">
+                        <div><dt>Web</dt><dd id="web-address"></dd></div>
+                        <div><dt>Network Drive TLS</dt><dd id="drive-address-https"></dd></div>
+                        <div><dt>Network Drive HTTP</dt><dd id="drive-address-http"></dd></div>
+                        <div><dt>TLS Certificate</dt><dd><a id="certificate-address" href="/clouddrive.crt">Download and trust</a></dd></div>
+                        <div><dt>Media Device</dt><dd>HTTP Basic authentication required</dd></div>
+                    </dl>
+                    <p class="account-muted">Windows HTTP mounts require WebClient Basic authentication. Prefer TLS after trusting this server's certificate.</p>
+                </article>
+            </div>
+
+            <form id="account-form" class="account-panel account-settings-form">
+                <div>
+                    <span class="account-eyebrow">PROFILE AND SECURITY</span>
+                    <h2>Update root account</h2>
+                    <p class="account-muted">The current password is required. Leave the new password blank to keep it unchanged.</p>
+                </div>
+                <label class="account-field">Display name<input id="account-display" required maxlength="80" autocomplete="name"></label>
+                <label class="account-field">Current password<input id="account-current-password" type="password" required minlength="10" maxlength="128" autocomplete="current-password"></label>
+                <label class="account-field">New password<input id="account-new-password" type="password" minlength="10" maxlength="128" autocomplete="new-password"></label>
+                <p id="account-message" class="account-message hidden" role="status"></p>
+                <div class="account-form-actions"><button class="btn btn-primary" type="submit">Save root account</button></div>
+            </form>
+        </section>
+    </main>
+    <script src="assets/account.js?v=3" defer></script>
+</body>
+</html>

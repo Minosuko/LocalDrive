@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>CloudDrive</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path fill='%23000' d='M19.35 10.04A7.49 7.49 0 0012 4C9.11 4 6.6 5.64 5.35 8.04A5.994 5.994 0 000 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96z'/></svg>">
+    <link rel="stylesheet" href="assets/style.css?v=49">
+</head>
+<body>
+    <!-- ── Mobile Overlay ── -->
+    <div id="mobile-overlay" class="mobile-overlay hidden"></div>
+
+    <!-- ── Sidebar ── -->
+    <aside id="sidebar" class="sidebar">
+        <div class="sidebar-header">
+            <div class="logo">
+                <svg viewBox="0 0 24 24" width="26" height="26" fill="currentColor">
+                    <path d="M19.35 10.04A7.49 7.49 0 0012 4C9.11 4 6.6 5.64 5.35 8.04A5.994 5.994 0 000 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96z"/>
+                </svg>
+                <span>CloudDrive</span>
+            </div>
+            <button id="btn-close-sidebar" class="btn-icon mobile-only">
+                <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+            </button>
+        </div>
+
+        <div class="sidebar-actions">
+            <button id="btn-new" class="btn-new">
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
+                New
+            </button>
+            <div id="new-menu" class="dropdown-menu hidden">
+                <button id="btn-upload-file">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M9 16h6v-6h4l-7-7-7 7h4v6zm-4 2h14v2H5v-2z"/></svg>
+                    File upload
+                </button>
+                <button id="btn-upload-folder">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-1 8h-3v3h-2v-3h-3v-2h3V9h2v3h3v2z"/></svg>
+                    Folder upload
+                </button>
+                <div class="dropdown-sep"></div>
+                <button id="btn-new-folder">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z"/></svg>
+                    New folder
+                </button>
+            </div>
+        </div>
+
+        <nav class="sidebar-nav">
+            <a href="#" id="nav-myfiles" class="nav-item active" onclick="event.preventDefault(); loadFiles('/');">
+                <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>
+                My Files
+            </a>
+            <a href="#" id="nav-trash" class="nav-item" onclick="event.preventDefault(); loadFiles('/Trash');">
+                <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+                Trash
+            </a>
+        </nav>
+
+        <!-- ── Folder Tree ── -->
+        <div class="sidebar-tree-header">FOLDERS</div>
+        <div id="sidebar-tree" class="sidebar-tree"></div>
+
+        <div class="sidebar-footer">
+            <div class="storage-widget">
+                <div class="storage-labels">
+                    <span>Storage</span>
+                    <span id="storage-text">...</span>
+                </div>
+                <div class="storage-bar-bg">
+                    <div id="storage-bar-fg" class="storage-bar-fg"></div>
+                </div>
+            </div>
+        </div>
+    </aside>
+
+    <!-- ── Main Workspace ── -->
+    <div class="workspace">
+        <!-- ── Topbar ── -->
+        <header class="topbar">
+            <div class="topbar-left">
+                <button id="btn-menu" class="btn-icon" title="Toggle sidebar">
+                    <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M3 18h18v-2H3v2zm0-5h18v-2H3v2zm0-7v2h18V6H3z"/></svg>
+                </button>
+                <div class="search-box">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+                    <input type="text" id="search-input" placeholder="Search files...">
+                </div>
+            </div>
+            
+            <div class="topbar-actions">
+                <button id="btn-empty-trash" class="btn btn-danger hidden" title="Empty Trash">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+                    Empty Trash
+                </button>
+                <button id="btn-theme" class="btn-icon" title="Toggle theme">
+                    <svg id="icon-moon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg>
+                    <svg id="icon-sun" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" style="display:none"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+                </button>
+                <button id="btn-settings" class="btn-icon" title="Settings">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M19.14,12.94c0.04-0.3,0.06-0.61,0.06-0.94c0-0.32-0.02-0.64-0.06-0.94l2.03-1.58c0.18-0.14,0.23-0.41,0.12-0.61l-1.92-3.32c-0.12-0.22-0.37-0.29-0.59-0.22l-2.39,0.96c-0.5-0.38-1.03-0.7-1.62-0.94L14.4,2.81c-0.04-0.24-0.24-0.41-0.48-0.41h-3.84c-0.24,0-0.43,0.17-0.47,0.41L9.25,5.35C8.66,5.59,8.12,5.92,7.63,6.29L5.24,5.33c-0.22-0.08-0.47,0-0.59,0.22L2.73,8.87C2.62,9.08,2.66,9.34,2.86,9.48l2.03,1.58C4.84,11.36,4.8,11.69,4.8,12s0.02,0.64,0.06,0.94l-2.03,1.58c-0.18,0.14-0.23,0.41-0.12,0.61l1.92,3.32c0.12,0.22,0.37,0.29,0.59,0.22l2.39-0.96c0.5,0.38,1.03,0.7,1.62,0.94l0.36,2.54c0.05,0.24,0.24,0.41,0.48,0.41h3.84c0.24,0,0.43-0.17,0.47-0.41l0.36-2.54c0.59-0.24,1.13-0.56,1.62-0.94l2.39,0.96c0.22,0.08,0.47,0,0.59-0.22l1.92-3.32c0.12-0.22,0.07-0.49-0.12-0.61L19.14,12.94z M12,15.6c-1.98,0-3.6-1.62-3.6-3.6s1.62-3.6,3.6-3.6s3.6,1.62,3.6,3.6S13.98,15.6,12,15.6z"/></svg>
+                </button>
+            </div>
+        </header>
+
+        <!-- ── Content Header ── -->
+        <div class="content-header">
+            <nav id="breadcrumbs" class="breadcrumbs">
+                <a href="#" data-path="/">Home</a>
+            </nav>
+            <div class="view-controls">
+                <button id="btn-clear-trash" class="btn btn-danger hidden" style="font-size:13px; padding: 6px 14px;">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+                    Clear Trash
+                </button>
+                <div class="sort-group-wrapper">
+                    <button id="btn-sort-group" class="btn-icon" title="Sort & Group">
+                        <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M3 18h6v-2H3v2zM3 6v2h18V6H3zm0 7h12v-2H3v2z"/></svg>
+                    </button>
+                    <div id="sort-group-menu" class="dropdown-menu sort-group-menu hidden">
+                        <div class="sort-group-label">Sort by</div>
+                        <button data-sort="name">Name</button>
+                        <button data-sort="date">Date</button>
+                        <button data-sort="size">Size</button>
+                        <div class="dropdown-sep"></div>
+                        <div class="sort-group-label">Direction</div>
+                        <button data-dir="asc">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M7 14l5-5 5 5H7z"/></svg>
+                            Ascending
+                        </button>
+                        <button data-dir="desc">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M7 10l5 5 5-5H7z"/></svg>
+                            Descending
+                        </button>
+                        <div class="dropdown-sep"></div>
+                        <div class="sort-group-label">Group by</div>
+                        <button data-group="none">None</button>
+                        <button data-group="name">Name</button>
+                        <button data-group="date">Date</button>
+                        <button data-group="size">Size</button>
+                    </div>
+                </div>
+                <button id="btn-view-toggle" class="btn-icon" title="Toggle view">
+                    <svg id="view-icon-grid" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M3 3h8v8H3V3zm0 10h8v8H3v-8zm10-10h8v8h-8V3zm0 10h8v8h-8v-8z"/></svg>
+                    <svg id="view-icon-list" viewBox="0 0 24 24" width="20" height="20" fill="currentColor" style="display:none"><path d="M3 14h4v-4H3v4zm0 5h4v-4H3v4zM3 9h4V5H3v4zm5 5h13v-4H8v4zm0 5h13v-4H8v4zM8 5v4h13V5H8z"/></svg>
+                </button>
+            </div>
+        </div>
+
+        <!-- ── Selection Bar ── -->
+        <div class="selection-wrapper">
+            <div id="selection-bar" class="selection-bar hidden">
+                <div class="sel-left">
+                    <button id="btn-clear-selection" class="btn-icon-sm" title="Clear selection">
+                        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+                    </button>
+                    <span id="selection-count">0 selected</span>
+                </div>
+                <div class="sel-right">
+                    <button class="btn btn-outline" id="btn-download-selected">
+                        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+                        Download ZIP
+                    </button>
+                    <button class="btn btn-outline" id="btn-convert-selected" style="display:none;">
+                        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M21 3H3v18h18V3zm-2 16H5V5h14v14zm-4-4h-2v-2h2v2zm-6 0h2v-2H9v2zm8-4h-2V9h2v2zm-4 0h-2V9h2v2zM9 11h2V9H9v2zm-2 4h2v-2H7v2z"/></svg>
+                        Convert
+                    </button>
+                    <button class="btn btn-outline" id="btn-zip-selected">
+                        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-6 4v2h-2v-2h2zm-2 4h2v-2h-2v2zm6-4h-2v2h2v-2zm-2 4v-2h-2v2h2zm-4 2h2v-2h-2v2z"/></svg>
+                        Compress to ZIP
+                    </button>
+                    <button class="btn btn-danger" id="btn-delete-selected">
+                        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+                        Delete
+                    </button>
+                    <button class="btn btn-outline hidden" id="btn-restore-selected">
+                        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg>
+                        Restore
+                    </button>
+                    <button class="btn btn-danger hidden" id="btn-delete-permanent-selected">
+                        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+                        Delete Permanently
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- ── Main File Area ── -->
+        <main id="file-container" class="file-container">
+            <div id="loading-state" class="state-msg">
+                <div class="spinner"></div>
+            </div>
+            <div id="empty-state" class="state-msg hidden">
+                <svg viewBox="0 0 24 24" width="64" height="64" fill="currentColor" opacity="0.1"><path d="M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z"/></svg>
+                <p class="state-title">No files yet</p>
+                <p class="state-sub">Drag and drop to upload files</p>
+            </div>
+            <div id="file-list" class="file-list grid"></div>
+        </main>
+    </div>
+
+    <!-- ── Context Menu ── -->
+    <!-- Position absolute, appended to body to avoid z-index/overflow clipping -->
+    <div id="context-menu" class="dropdown-menu hidden" style="position: fixed; z-index: 9999;">
+        <button data-action="open">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2z"/></svg>
+            Open
+        </button>
+        <button data-action="download">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+            Download
+        </button>
+        <div class="dropdown-sep"></div>
+        <button data-action="rename">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 000-1.41l-2.34-2.34a1 1 0 00-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>
+            Rename
+        </button>
+        <button data-action="move">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-6 12l-4-4h3V10h2v4h3l-4 4z"/></svg>
+            Move
+        </button>
+        <button data-action="zip">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-6 4v2h-2v-2h2zm-2 4h2v-2h-2v2zm6-4h-2v2h2v-2zm-2 4v-2h-2v2h2zm-4 2h2v-2h-2v2z"/></svg>
+            Compress to ZIP
+        </button>
+        <button data-action="unzip_here">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-6 4v2h-2v-2h2zm-2 4h2v-2h-2v2zm6-4h-2v2h2v-2zm-2 4v-2h-2v2h2zm-4 2h2v-2h-2v2z"/></svg>
+            Extract Here
+        </button>
+        <button data-action="unzip_to">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-6 4v2h-2v-2h2zm-2 4h2v-2h-2v2zm6-4h-2v2h2v-2zm-2 4v-2h-2v2h2zm-4 2h2v-2h-2v2z"/></svg>
+            Extract To…
+        </button>
+        <button data-action="convert" style="display:none;">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M21 3H3v18h18V3zm-2 16H5V5h14v14zm-4-4h-2v-2h2v2zm-6 0h2v-2H9v2zm8-4h-2V9h2v2zm-4 0h-2V9h2v2zM9 11h2V9H9v2zm-2 4h2v-2H7v2z"/></svg>
+            Convert Image
+        </button>
+        <div class="dropdown-sep"></div>
+        <button data-action="delete" class="danger">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+            Delete
+        </button>
+        <button data-action="restore" style="display:none; color:var(--text-1);">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg>
+            Restore
+        </button>
+        <button data-action="delete_permanent" class="danger" style="display:none;">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+            Delete Permanently
+        </button>
+    </div>
+
+    <!-- ── Background Context Menu ── -->
+    <div id="bg-context-menu" class="dropdown-menu hidden" style="position: fixed; z-index: 9999;">
+        <button data-action="refresh">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+            Refresh
+        </button>
+        <div class="dropdown-sep"></div>
+        <div class="dropdown-item-has-submenu">
+            <button>
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M3 18h6v-2H3v2zM3 6v2h18V6H3zm0 7h12v-2H3v2z"/></svg>
+                Sort By
+                <svg class="submenu-arrow" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg>
+            </button>
+            <div class="dropdown-submenu">
+                <button data-sort="name" class="sort-group-btn">Name</button>
+                <button data-sort="date" class="sort-group-btn">Date</button>
+                <button data-sort="size" class="sort-group-btn">Size</button>
+            </div>
+        </div>
+        <div class="dropdown-item-has-submenu">
+            <button>
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M7 14l5-5 5 5H7z"/></svg>
+                Direction
+                <svg class="submenu-arrow" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg>
+            </button>
+            <div class="dropdown-submenu">
+                <button data-dir="asc" class="sort-group-btn">Ascending</button>
+                <button data-dir="desc" class="sort-group-btn">Descending</button>
+            </div>
+        </div>
+        <div class="dropdown-item-has-submenu">
+            <button>
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M4 6h16v2H4zm0 5h16v2H4zm0 5h16v2H4z"/></svg>
+                Group By
+                <svg class="submenu-arrow" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg>
+            </button>
+            <div class="dropdown-submenu">
+                <button data-group="none" class="sort-group-btn">None</button>
+                <button data-group="name" class="sort-group-btn">Name</button>
+                <button data-group="date" class="sort-group-btn">Date</button>
+                <button data-group="size" class="sort-group-btn">Size</button>
+            </div>
+        </div>
+        <div class="dropdown-sep"></div>
+        <button data-action="new_folder">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-1 8h-3v3h-2v-3h-3v-2h3V9h2v3h3v2z"/></svg>
+            New Folder
+        </button>
+        <button data-action="new_file">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zM6 20V4h7v5h5v11H6z"/></svg>
+            New File
+        </button>
+        <div class="dropdown-sep"></div>
+        <button data-action="upload_file">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z"/></svg>
+            Upload File
+        </button>
+        <button data-action="upload_folder">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-1 8h-3v3h-2v-3h-3v-2h3V9h2v3h3v2z"/></svg>
+            Upload Folder
+        </button>
+    </div>
+
+
+    <!-- ── File Viewer Modal ── -->
+    <div id="viewer-overlay" class="viewer-overlay hidden">
+        <div class="viewer-header">
+            <div class="viewer-title" id="viewer-title">Filename.ext</div>
+            <div class="viewer-actions">
+                <button class="btn-icon" id="btn-viewer-download" title="Download">
+                    <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+                </button>
+                <button class="btn-icon" id="btn-viewer-close" title="Close">
+                    <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+                </button>
+            </div>
+        </div>
+        <div class="viewer-body" id="viewer-body">
+            <!-- Content injected via JS -->
+        </div>
+        <button id="viewer-prev" class="viewer-nav-btn hidden" title="Previous Image">
+            <svg viewBox="0 0 24 24" width="36" height="36" fill="currentColor"><path d="M15.41 16.59L10.83 12l4.58-4.59L14 6l-6 6 6 6 1.41-1.41z"/></svg>
+        </button>
+        <button id="viewer-next" class="viewer-nav-btn hidden" title="Next Image">
+            <svg viewBox="0 0 24 24" width="36" height="36" fill="currentColor"><path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6-1.41-1.41z"/></svg>
+        </button>
+    </div>
+
+    <!-- ── Upload Panel ── -->
+    <div id="upload-panel" class="upload-panel hidden">
+        <div class="upload-panel-head">
+            <span id="upload-panel-title">Uploads</span>
+            <div class="upload-panel-btns">
+                <button class="btn-icon-sm" id="btn-clear-uploads" title="Clear Completed">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M5 13h14v-2H5v2zm-2 4h14v-2H3v2zM7 7v2h14V7H7z"/></svg>
+                </button>
+                <button class="btn-icon-sm" id="btn-minimize-uploads">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M19 13H5v-2h14v2z"/></svg>
+                </button>
+                <button class="btn-icon-sm" id="btn-close-uploads">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+                </button>
+            </div>
+        </div>
+        <div id="upload-list" class="upload-list"></div>
+    </div>
+
+    <!-- ── Drop Overlay ── -->
+    <div id="drop-overlay" class="drop-overlay hidden">
+        <div class="drop-box">
+            <svg viewBox="0 0 24 24" width="48" height="48" fill="currentColor">
+                <path d="M19.35 10.04A7.49 7.49 0 0012 4C9.11 4 6.6 5.64 5.35 8.04A5.994 5.994 0 000 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z"/>
+            </svg>
+            <p>Drop files to upload</p>
+        </div>
+    </div>
+
+    <!-- ── Input Modal ── -->
+    <div id="modal-overlay" class="modal-overlay hidden">
+        <div class="modal">
+            <div class="modal-head">
+                <h3 id="modal-title"></h3>
+                <button class="btn-icon-sm" id="btn-modal-close">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+                </button>
+            </div>
+            <div id="modal-body" class="modal-body"></div>
+            <div class="modal-foot">
+                <button class="btn btn-outline" id="btn-modal-cancel">Cancel</button>
+                <button class="btn btn-primary" id="btn-modal-confirm">Confirm</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Move Modal ── -->
+    <div id="move-modal" class="modal-overlay hidden" style="z-index: 400;">
+        <div class="modal" style="width: 500px; max-width: 90vw; height: 60vh; display: flex; flex-direction: column;">
+            <div class="modal-head">
+                <h3 id="move-modal-title">Move Items</h3>
+                <button class="btn-icon-sm" id="btn-move-close">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+                </button>
+            </div>
+            <div class="move-breadcrumbs" id="move-breadcrumbs"></div>
+            <div id="move-body" class="modal-body" style="flex: 1; overflow-y: auto; padding: 10px;">
+                <!-- Folder list injected here -->
+            </div>
+            <div class="modal-foot">
+                <button class="btn btn-outline" id="btn-move-cancel">Cancel</button>
+                <button class="btn btn-primary" id="btn-move-confirm">Move Here</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Settings Modal ── -->
+    <div id="settings-overlay" class="modal-overlay hidden" style="z-index: 250;">
+        <div class="modal settings-modal">
+            <div class="modal-head">
+                <h3>Settings</h3>
+                <button class="btn-icon-sm" id="btn-settings-close">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+                </button>
+            </div>
+            <div class="settings-body">
+                <!-- Metrics Section -->
+                <div class="settings-section">
+                    <h4 class="settings-section-title">Storage Metrics</h4>
+                    <div class="settings-metrics" id="settings-metrics">
+                        <div class="metric-card">
+                            <div class="metric-label">Disk Usage</div>
+                            <div class="metric-bar"><div class="metric-bar-fill" id="metric-disk-bar"></div></div>
+                            <div class="metric-value" id="metric-disk-val">—</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-label">Cache</div>
+                            <div class="metric-value" id="metric-cache-val">—</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-label">Trash</div>
+                            <div class="metric-value" id="metric-trash-val">—</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-label">Chunks</div>
+                            <div class="metric-value" id="metric-chunk-val">—</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="settings-section">
+                    <h4 class="settings-section-title">Root Account</h4>
+                    <p style="color:var(--text-2); margin-bottom:12px;">One root login protects the web app, Network Drive, Media Device, and mobile API.</p>
+                    <a class="btn btn-outline" href="account.html" style="display:inline-flex; text-decoration:none;">Manage Root Account</a>
+                </div>
+
+                <!-- Cleanup Section -->
+                <div class="settings-section">
+                    <h4 class="settings-section-title">Cleanup</h4>
+                    <div class="settings-cleanup-btns">
+                        <button class="btn btn-outline" id="btn-clean-syscache">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+                            Clean System Cache
+                        </button>
+                        <button class="btn btn-outline" id="btn-clean-imgcache">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+                            Clean Thumbnails
+                        </button>
+                        <button class="btn btn-outline" id="btn-clean-chunk">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+                            Clean Chunks
+                        </button>
+                        <button class="btn btn-danger" id="btn-clean-trash">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+                            Empty Trash
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Performance Section -->
+                <div class="settings-section">
+                    <h4 class="settings-section-title">Performance</h4>
+                    <div class="settings-fields">
+                        <div class="settings-field">
+                            <label for="cfg-memory-limit">Memory Limit (MB)</label>
+                            <input type="number" id="cfg-memory-limit" min="128" step="64" value="128">
+                        </div>
+                        <div class="settings-field">
+                            <label for="cfg-buffer-size">Buffer Size (KB)</label>
+                            <input type="number" id="cfg-buffer-size" min="128" step="128" value="2048">
+                        </div>
+                        <div class="settings-field">
+                            <label for="cfg-chunk-size">Upload Chunk Size (MB)</label>
+                            <input type="number" id="cfg-chunk-size" min="1" step="1" value="500">
+                        </div>
+                        <div class="settings-field">
+                            <label for="cfg-max-uploads">Max Upload Concurrency</label>
+                            <input type="number" id="cfg-max-uploads" min="1" max="10" step="1" value="3">
+                        </div>
+                        <div class="settings-field">
+                            <label for="cfg-thumb-quality">Thumbnail Quality (1-100)</label>
+                            <input type="number" id="cfg-thumb-quality" min="10" max="100" step="1" value="80">
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-foot">
+                <button class="btn btn-outline" id="btn-settings-cancel">Close</button>
+                <button class="btn btn-primary" id="btn-settings-save">Save Settings</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Image Converter Modal ── -->
+    <div id="converter-overlay" class="modal-overlay hidden">
+        <div class="modal" style="max-width: 480px;">
+            <div class="modal-head"><h3>Convert Image</h3></div>
+            <div class="modal-body" style="display:flex; flex-direction:column; gap:14px;">
+                <div id="converter-source" style="font-size:14px; color:var(--text-2); word-break:break-all;"></div>
+                <div style="display:flex; flex-direction:column; gap:6px;">
+                    <label style="font-size:13px; color:var(--text-2);">Target Format</label>
+                    <select id="converter-format" class="input" style="padding:8px 12px; border-radius:8px; background:var(--bg-2); color:var(--text-1); border:1px solid var(--border);">
+                        <option value="png">PNG</option>
+                        <option value="jpg">JPG</option>
+                        <option value="jpeg">JPEG</option>
+                        <option value="webp">WEBP</option>
+                        <option value="bmp">BMP</option>
+                        <option value="gif">GIF</option>
+                        <option value="avif">AVIF</option>
+                    </select>
+                </div>
+                <div id="converter-quality-wrap" style="display:flex; flex-direction:column; gap:6px;">
+                    <label style="font-size:13px; color:var(--text-2);">Compression Quality: <span id="converter-quality-val">85</span>%</label>
+                    <input type="range" id="converter-quality" min="1" max="100" value="85" style="accent-color:var(--accent);">
+                </div>
+                <div id="converter-status" style="font-size:13px; color:var(--accent); display:none;"></div>
+            </div>
+            <div class="modal-foot">
+                <button class="btn btn-outline" id="converter-cancel">Cancel</button>
+                <button class="btn btn-primary" id="converter-submit">Convert</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Hidden inputs -->
+    <input type="file" id="file-input" multiple hidden>
+    <input type="file" id="folder-input" webkitdirectory multiple hidden>
+
+    <script src="assets/app.js?v=65"></script>
+</body>
+</html>
