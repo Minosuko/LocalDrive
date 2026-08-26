@@ -7,6 +7,7 @@ let CHUNK_SIZE = 5 * 1024 * 1024; // Default 5MB chunks
 let MAX_UPLOADS = 3;
 let UPLOAD_CONCURRENCY = 1;
 let accountRedirecting = false;
+const CLIENT_CONFIG_CACHE_KEY = 'cloud_client_config_v1';
 
 const nativeFetch = window.fetch.bind(window);
 window.fetch = async (...args) => {
@@ -64,25 +65,43 @@ document.addEventListener('DOMContentLoaded', () => {
     init();
 });
 
-async function init() {
+function init() {
     applyTheme();
     applyView();
     if (localStorage.getItem('cd_sidebar') === '1' && window.innerWidth > 768) {
         dom.sidebar.classList.add('collapsed');
     }
     try {
-        const r = await fetch(`${API}/settings/?config_only=1`);
-        const j = await r.json();
-        const c = j.config || {};
-        if (c.chunk_size) CHUNK_SIZE = c.chunk_size * 1024 * 1024;
-        if (c.max_uploads) MAX_UPLOADS = Math.max(1, Math.min(10, Number(c.max_uploads) || 3));
-    } catch (e) {}
+        applyClientConfig(JSON.parse(localStorage.getItem(CLIENT_CONFIG_CACHE_KEY) || 'null'));
+    } catch (_) {
+        localStorage.removeItem(CLIENT_CONFIG_CACHE_KEY);
+    }
 
+    bind();
+    refreshClientConfig();
     const savedPath = localStorage.getItem('cd_path') || '/';
     loadFiles(savedPath);
     refreshSidebarTree();
     loadStorageInfo();
-    bind();
+}
+
+function applyClientConfig(config) {
+    if (!config || typeof config !== 'object') return;
+    if (config.chunk_size) CHUNK_SIZE = config.chunk_size * 1024 * 1024;
+    if (config.max_uploads) MAX_UPLOADS = Math.max(1, Math.min(10, Number(config.max_uploads) || 3));
+}
+
+async function refreshClientConfig() {
+    try {
+        const r = await fetch(`${API}/settings/?config_only=1`);
+        const j = await r.json();
+        const c = j.config || {};
+        applyClientConfig(c);
+        localStorage.setItem(CLIENT_CONFIG_CACHE_KEY, JSON.stringify({
+            chunk_size: Number(c.chunk_size) || 5,
+            max_uploads: Number(c.max_uploads) || 3,
+        }));
+    } catch (_) {}
 }
 
 function applyTheme() {
@@ -150,8 +169,6 @@ async function loadFiles(path, silent = false) {
     try {
         let endpoint = `${API}/files/?path=${encodeURIComponent(state.path)}`;
         if (state.path === '/Trash') endpoint = `${API}/trash/`;
-        endpoint += (endpoint.includes('?') ? '&' : '?') + `t=${Date.now()}`;
-        
         const r = await fetch(endpoint, { signal: _loadAbort.signal });
         const j = await r.json();
 
@@ -276,7 +293,7 @@ function updateTreeActive(activePath) {
 async function loadSidebarTree(activePath, container) {
     container.innerHTML = '<div style="padding:12px; color:var(--text-3); font-size:12px;">Loading tree...</div>';
     try {
-        const r = await fetch(`${API}/tree/?t=${Date.now()}`);
+        const r = await fetch(`${API}/tree/`);
         const j = await r.json();
         if (!j.success) return;
         

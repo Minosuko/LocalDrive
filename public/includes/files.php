@@ -24,16 +24,25 @@ function handle_list() {
     $etagFile = $cacheFile . '.etag';
     $cacheVersionFile = $cacheFile . '.version';
     $lockFile = CACHE_DIR . DIRECTORY_SEPARATOR . 'dir_' . $cacheKey . '.lock';
-    $versionFile = CACHE_DIR . DIRECTORY_SEPARATOR . 'dir_' . $cacheKey . '.version';
+    $versionFile = CACHE_DIR . DIRECTORY_SEPARATOR . 'dir_' . $cacheKey . '.generation';
+    if (!is_file($versionFile)) @atomic_write_file($versionFile, bin2hex(random_bytes(12)));
     $cacheGeneration = @file_get_contents($versionFile) ?: '';
 
     // Serve from cache if valid and fresh (< 60s to catch external edits, or strictly rely on invalidation)
     if (($_GET['refresh'] ?? '') !== '1' && file_exists($cacheFile) && time() - filemtime($cacheFile) < 60
         && (@filemtime($real) ?: 0) <= filemtime($cacheFile)
         && hash_equals((string)$cacheGeneration, (string)(@file_get_contents($cacheVersionFile) ?: ''))) {
+        $cachedEtag = trim((string)@file_get_contents($etagFile));
+        if ($cachedEtag !== '' && directory_etag_matches($cachedEtag)) {
+            header('Cache-Control: private, no-cache, no-transform');
+            header('Vary: Authorization');
+            header('ETag: ' . $cachedEtag);
+            http_response_code(304);
+            exit;
+        }
         $cached = file_get_contents($cacheFile);
         if ($cached !== false) {
-            send_directory_json($cached);
+            send_directory_json($cached, $cachedEtag ?: null);
         }
     }
 
@@ -90,6 +99,7 @@ function handle_list() {
         if (!hash_equals($cacheGeneration, $currentGeneration)) return;
         @unlink($cacheVersionFile);
         if (@atomic_write_file($cacheFile, $json)) {
+            @atomic_write_file($etagFile, $etag);
             @atomic_write_file($cacheVersionFile, $currentGeneration);
         }
     });
@@ -102,19 +112,24 @@ function send_directory_json($json, $etag = null) {
     header('Cache-Control: private, no-cache, no-transform');
     header('Vary: Authorization');
     header('ETag: ' . $etag);
-    if (isset($_SERVER['HTTP_IF_NONE_MATCH'])) {
-        foreach (explode(',', $_SERVER['HTTP_IF_NONE_MATCH']) as $candidate) {
-            $candidate = trim($candidate);
-            if (strpos($candidate, 'W/') === 0) $candidate = substr($candidate, 2);
-            if ($candidate === '*' || hash_equals($etag, $candidate)) {
-                http_response_code(304);
-                exit;
-            }
-        }
+    if (directory_etag_matches($etag)) {
+        http_response_code(304);
+        exit;
     }
     header('Content-Length: ' . strlen($json));
     echo $json;
     exit;
+}
+
+function directory_etag_matches($etag) {
+    if (isset($_SERVER['HTTP_IF_NONE_MATCH'])) {
+        foreach (explode(',', $_SERVER['HTTP_IF_NONE_MATCH']) as $candidate) {
+            $candidate = trim($candidate);
+            if (strpos($candidate, 'W/') === 0) $candidate = substr($candidate, 2);
+            if ($candidate === '*' || hash_equals($etag, $candidate)) return true;
+        }
+    }
+    return false;
 }
 
 function handle_create_folder() {

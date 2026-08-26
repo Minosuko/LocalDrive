@@ -2,12 +2,15 @@
     'use strict';
 
     const API = '/api/mobile/v1';
+    const SERVER_INFO_CACHE_KEY = 'cloud_server_info_v1';
+    const cachedServerInfo = readServerInfoCache();
     const state = {
         access: sessionStorage.getItem('cloud_access') || '',
         refresh: sessionStorage.getItem('cloud_refresh') || '',
         user: null,
         bootstrap: false,
-        serverInfo: null,
+        serverInfo: cachedServerInfo?.data || null,
+        serverInfoEtag: cachedServerInfo?.etag || '',
     };
     const $ = id => document.getElementById(id);
     const elements = {
@@ -114,6 +117,10 @@
             ? `Last signed in ${new Date(root.last_login_at * 1000).toLocaleString()}`
             : 'Root account ready';
         elements.accountDisplay.value = displayName;
+        renderServerInfo();
+    }
+
+    function renderServerInfo() {
         elements.webAddress.textContent = `${location.origin}/`;
         const info = state.serverInfo || {};
         const hostname = location.hostname;
@@ -124,6 +131,36 @@
             ? 'Disabled'
             : `https://${hostname}:${httpsPort}/network-drive/`;
         elements.certificateAddress.href = info.certificate_url || '/clouddrive.crt';
+    }
+
+    function readServerInfoCache() {
+        try {
+            const cached = JSON.parse(localStorage.getItem(SERVER_INFO_CACHE_KEY) || 'null');
+            if (!cached || typeof cached.data !== 'object') return null;
+            return cached;
+        } catch (_) {
+            localStorage.removeItem(SERVER_INFO_CACHE_KEY);
+            return null;
+        }
+    }
+
+    async function refreshServerInfo() {
+        try {
+            const headers = { Accept: 'application/json' };
+            if (state.serverInfoEtag) headers['If-None-Match'] = state.serverInfoEtag;
+            const response = await fetch('/api/server-info', { headers, cache: 'no-cache' });
+            if (response.status === 304) return;
+            if (!response.ok) return;
+            const data = await response.json();
+            state.serverInfo = data;
+            state.serverInfoEtag = response.headers.get('ETag') || '';
+            localStorage.setItem(SERVER_INFO_CACHE_KEY, JSON.stringify({
+                data,
+                etag: state.serverInfoEtag,
+                saved_at: Date.now(),
+            }));
+            renderServerInfo();
+        } catch (_) {}
     }
 
     async function showAccount() {
@@ -208,10 +245,7 @@
     });
 
     (async () => {
-        try {
-            const response = await fetch('/api/server-info', { headers: { Accept: 'application/json' } });
-            if (response.ok) state.serverInfo = await response.json();
-        } catch (_) {}
+        refreshServerInfo();
         showAccount().catch(() => {
             clearLocalSession();
             showAuth();

@@ -16,8 +16,16 @@ $cacheVersionFile = $cacheFile . '.version';
 $etagFile = $cacheFile . '.etag';
 if (file_exists($cacheFile) && time() - filemtime($cacheFile) < 120
     && hash_equals($generation, @file_get_contents($cacheVersionFile) ?: '')) {
+    $cachedEtag = trim((string)@file_get_contents($etagFile));
+    if ($cachedEtag !== '' && trim($_SERVER['HTTP_IF_NONE_MATCH'] ?? '') === $cachedEtag) {
+        header('Cache-Control: private, no-cache, no-transform');
+        header('Vary: Authorization');
+        header('ETag: ' . $cachedEtag);
+        http_response_code(304);
+        exit;
+    }
     $cached = file_get_contents($cacheFile);
-    if ($cached !== false) send_tree_json($cached);
+    if ($cached !== false) send_tree_json($cached, $cachedEtag ?: null);
 }
 
 $root = rtrim(str_replace('\\', '/', STORAGE_DIR), '/');
@@ -83,6 +91,7 @@ with_cache_file_lock($cacheFile . '.lock', static function () use (
     if (!hash_equals($generation, @file_get_contents($versionFile) ?: '')) return;
     @unlink($cacheVersionFile);
     if (@atomic_write_file($cacheFile, $json)) {
+        @atomic_write_file($etagFile, $etag);
         @atomic_write_file($cacheVersionFile, $generation);
     }
 });

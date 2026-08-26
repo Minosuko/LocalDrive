@@ -130,7 +130,7 @@ function invalidate_dir_cache($realDir) {
     foreach ([$keyAll, $keyFolders] as $key) {
         with_cache_file_lock(CACHE_DIR . DIRECTORY_SEPARATOR . 'dir_' . $key . '.lock', static function () use ($key, $version) {
             $cacheFile = CACHE_DIR . DIRECTORY_SEPARATOR . 'dir_' . $key . '.json';
-            @atomic_write_file(CACHE_DIR . DIRECTORY_SEPARATOR . 'dir_' . $key . '.version', $version);
+            @atomic_write_file(CACHE_DIR . DIRECTORY_SEPARATOR . 'dir_' . $key . '.generation', $version);
             @unlink($cacheFile);
             @unlink($cacheFile . '.etag');
             @unlink($cacheFile . '.version');
@@ -263,18 +263,25 @@ function get_storage_info_cached($maximumAge = 10) {
     if (!is_file($generationFile)) @atomic_write_file($generationFile, bin2hex(random_bytes(12)));
     $generation = @file_get_contents($generationFile) ?: '';
     $cacheFile = CACHE_DIR . DIRECTORY_SEPARATOR . 'storage-info.json';
-    $readCache = static function () use ($cacheFile, $generation, $maximumAge) {
+    $readCache = static function ($allowStale = false) use ($cacheFile, $maximumAge) {
         if (!is_file($cacheFile)) return null;
         $cached = json_decode((string)@file_get_contents($cacheFile), true);
-        if (!is_array($cached) || !hash_equals($generation, (string)($cached['generation'] ?? ''))) return null;
-        if (time() - (int)($cached['generated_at'] ?? 0) > $maximumAge) return null;
+        if (!is_array($cached) || !is_array($cached['data'] ?? null)) return null;
+        if (!$allowStale && time() - (int)($cached['generated_at'] ?? 0) > $maximumAge) return null;
         return $cached['data'] ?? null;
     };
     $cached = $readCache();
     if (is_array($cached)) return $cached;
 
     $lock = @fopen(CACHE_DIR . DIRECTORY_SEPARATOR . 'storage-info.lock', 'c');
-    if (is_resource($lock)) @flock($lock, LOCK_EX);
+    if (is_resource($lock) && !@flock($lock, LOCK_EX | LOCK_NB)) {
+        $stale = $readCache(true);
+        if (is_array($stale)) {
+            fclose($lock);
+            return $stale;
+        }
+        @flock($lock, LOCK_EX);
+    }
     try {
         $cached = $readCache();
         if (is_array($cached)) return $cached;
@@ -282,7 +289,7 @@ function get_storage_info_cached($maximumAge = 10) {
         $free = @disk_free_space(STORAGE_DIR) ?: 0;
         $data = ['used_space' => $used, 'total_space' => $used + $free, 'free_space' => $free];
         @atomic_write_file($cacheFile, json_encode([
-            'generation' => $generation,
+            'generation' => @file_get_contents($generationFile) ?: $generation,
             'generated_at' => time(),
             'data' => $data,
         ], JSON_UNESCAPED_SLASHES));

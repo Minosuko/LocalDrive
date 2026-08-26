@@ -1202,6 +1202,121 @@ function router_atomic_write_file($path, $contents)
     return true;
 }
 
+function router_storage_root()
+{
+    $override = getenv('CLOUDDRIVE_MOBILE_STORAGE_ROOT');
+    return $override !== false && trim($override) !== ''
+        ? rtrim(trim($override), '/\\')
+        : __DIR__ . DIRECTORY_SEPARATOR . 'storage';
+}
+
+function router_request_body_directory()
+{
+    $directory = router_storage_root() . DIRECTORY_SEPARATOR . 'system' . DIRECTORY_SEPARATOR . 'request-bodies';
+    if (!is_dir($directory) && !@mkdir($directory, 0700, true) && !is_dir($directory)) return null;
+    static $swept = false;
+    if (!$swept && getenv('CLOUDDRIVE_BODY_HANDOFF_SECRET') === false) {
+        $swept = true;
+        foreach (glob($directory . DIRECTORY_SEPARATOR . 'clouddrive_request_*') ?: [] as $candidate) {
+            if (is_file($candidate) && time() - (@filemtime($candidate) ?: time()) > 86400) @unlink($candidate);
+        }
+    }
+    return realpath($directory) ?: $directory;
+}
+
+function router_mobile_dav_bearer_authorized($headers)
+{
+    static $statement = null;
+    $authorization = trim((string)($headers['authorization'] ?? ''));
+    if (!preg_match('/^Bearer\s+([A-Za-z0-9_-]{20,})$/i', $authorization, $matches)) return false;
+    $databasePath = router_storage_root() . DIRECTORY_SEPARATOR . 'system' . DIRECTORY_SEPARATOR . 'mobile-api.sqlite';
+    if (!is_file($databasePath)) return false;
+    try {
+        if ($statement === null) {
+            $database = new PDO('sqlite:' . $databasePath, null, null, [
+                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                PDO::ATTR_TIMEOUT => 2,
+            ]);
+            $statement = $database->prepare(<<<'SQL'
+SELECT sessions.access_expires_at
+FROM sessions JOIN users ON users.id = sessions.user_id
+WHERE sessions.access_token_hash = ? AND users.role = 'root' AND users.status = 'active'
+SQL
+            );
+        }
+        $statement->execute([hash('sha256', $matches[1])]);
+        return (int)($statement->fetchColumn() ?: 0) > time();
+    } catch (Throwable $error) {
+        return false;
+    }
+}
+
+function router_base64url_encode($value)
+{
+    return rtrim(strtr(base64_encode($value), '+/', '-_'), '=');
+}
+
+function router_base64url_decode($value)
+{
+    if (!is_string($value) || !preg_match('/^[A-Za-z0-9_-]+$/D', $value)) return false;
+    $padding = strlen($value) % 4;
+    if ($padding) $value .= str_repeat('=', 4 - $padding);
+    return base64_decode(strtr($value, '-_', '+/'), true);
+}
+
+function router_body_handoff_signature($secret, $method, $target, $length, $encodedPath)
+{
+    return hash_hmac('sha256', $method . "\n" . $target . "\n" . $length . "\n" . $encodedPath, $secret);
+}
+
+function router_parse_decimal_length($value)
+{
+    $value = trim((string)$value);
+    if ($value === '' || !preg_match('/^\d+$/D', $value)) return null;
+    $normalized = ltrim($value, '0');
+    if ($normalized === '') return 0;
+    $maximum = (string)PHP_INT_MAX;
+    if (strlen($normalized) > strlen($maximum)
+        || (strlen($normalized) === strlen($maximum) && strcmp($normalized, $maximum) > 0)) {
+        return null;
+    }
+    return (int)$normalized;
+}
+
+function router_maximum_body_bytes($config)
+{
+    $maximumMegabytes = intdiv(PHP_INT_MAX, 1024 * 1024);
+    $configured = max(1, (int)($config['max_request_body_mb'] ?? 10240));
+    return min($configured, $maximumMegabytes) * 1024 * 1024;
+}
+
+function router_proxy_signature($secret, $method, $target, $remoteAddress, $scheme, $port)
+{
+    return hash_hmac('sha256', $method . "\n" . $target . "\n" . $remoteAddress . "\n" . $scheme . "\n" . $port, $secret);
+}
+
+function router_probe_application_backend($address, $secret)
+{
+    $backend = @stream_socket_client('tcp://' . $address, $errorNumber, $errorMessage, 0.2);
+    if ($backend === false) return false;
+    stream_set_timeout($backend, 1);
+    $nonce = bin2hex(random_bytes(16));
+    $request = "GET /__clouddrive_backend_ready HTTP/1.1\r\n"
+        . "Host: localhost\r\nX-CloudDrive-Backend-Challenge: $nonce\r\nConnection: close\r\n\r\n";
+    if (!router_write_all($backend, $request)) {
+        fclose($backend);
+        return false;
+    }
+    $response = stream_get_contents($backend);
+    fclose($backend);
+    if (!is_string($response) || strpos($response, " 200 ") === false) return false;
+    $separator = strpos($response, "\r\n\r\n");
+    if ($separator === false) return false;
+    $body = trim(substr($response, $separator + 4));
+    return hash_equals(hash_hmac('sha256', "ready\n" . $nonce, $secret), $body);
+}
+
 function router_start_application_backend()
 {
     $reservation = @stream_socket_server('tcp://127.0.0.1:0', $errorNumber, $errorMessage);
@@ -1229,20 +1344,22 @@ function router_start_application_backend()
         '-S', $address,
         __FILE__,
     ];
-    $process = @proc_open($command, $descriptors, $pipes, __DIR__, null, ['bypass_shell' => true]);
+    $handoffSecret = bin2hex(random_bytes(32));
+    $environment = is_array(getenv()) ? getenv() : [];
+    $environment['CLOUDDRIVE_BODY_HANDOFF_SECRET'] = $handoffSecret;
+    $process = @proc_open($command, $descriptors, $pipes, __DIR__, $environment, ['bypass_shell' => true]);
     if (!is_resource($process)) return null;
 
     for ($attempt = 0; $attempt < 50; $attempt++) {
         $status = proc_get_status($process);
         if (!$status['running']) break;
-        $probe = @stream_socket_client('tcp://' . $address, $probeNumber, $probeMessage, 0.1);
-        if ($probe !== false) {
-            fclose($probe);
+        if (router_probe_application_backend($address, $handoffSecret)) {
             return [
                 'address' => $address,
                 'process' => $process,
                 'upload_limit' => $uploadLimit,
                 'memory_limit' => $memoryLimit,
+                'handoff_secret' => $handoffSecret,
             ];
         }
         usleep(20000);
@@ -1318,36 +1435,72 @@ function router_handle_connection($client, $cgiBinary, $host, $port)
         }
         [$name, $value] = explode(':', $line, 2);
         $name = strtolower(trim($name));
+        $canonicalName = str_replace('_', '-', $name);
+        if (strpos($canonicalName, 'x-clouddrive-') === 0) $name = $canonicalName;
         $value = trim($value);
         $headers[$name] = isset($headers[$name]) ? $headers[$name] . ', ' . $value : $value;
     }
 
-    if (($headers['expect'] ?? '') !== '' && stripos($headers['expect'], '100-continue') !== false) {
-        fwrite($client, "HTTP/1.1 100 Continue\r\n\r\n");
-    }
-
-    $declaredLength = (int)($headers['content-length'] ?? 0);
-    if ($declaredLength < 0) {
+    $declaredHeader = trim((string)($headers['content-length'] ?? ''));
+    $declaredLength = $declaredHeader === '' ? 0 : router_parse_decimal_length($declaredHeader);
+    if ($declaredLength === null) {
         router_write_simple_response($client, 400, 'Invalid Content-Length');
         return;
     }
-    $hasBody = stripos($headers['transfer-encoding'] ?? '', 'chunked') !== false || $declaredLength > 0;
+    $transferEncoding = strtolower(trim((string)($headers['transfer-encoding'] ?? '')));
+    if ($transferEncoding !== '' && $transferEncoding !== 'chunked') {
+        router_write_simple_response($client, 400, 'Unsupported Transfer-Encoding');
+        return;
+    }
+    if ($transferEncoding !== '' && $declaredHeader !== '') {
+        router_write_simple_response($client, 400, 'Ambiguous request framing');
+        return;
+    }
+    $config = router_load_config();
+    $maximumBodyBytes = router_maximum_body_bytes($config);
+    $requestPath = parse_url($requestTarget, PHP_URL_PATH);
+    $requestPath = is_string($requestPath) ? rawurldecode($requestPath) : '/';
+    $routeMaximumBytes = $maximumBodyBytes;
+    if (rtrim($requestPath, '/') === '/api/mobile/v1/files/status') {
+        $routeMaximumBytes = min($routeMaximumBytes, 2 * 1024 * 1024);
+    } elseif (in_array(rtrim($requestPath, '/'), [
+        '/api/mobile/v1/auth/login', '/api/mobile/v1/auth/register', '/api/mobile/v1/auth/refresh',
+    ], true)) {
+        $routeMaximumBytes = min($routeMaximumBytes, 64 * 1024);
+    }
+    if ($declaredLength > $routeMaximumBytes) {
+        router_write_simple_response($client, 413, 'Request body is too large');
+        return;
+    }
+    $hasBody = $transferEncoding === 'chunked' || $declaredLength > 0;
+    $isMobileDav = $requestPath === '/api/mobile/v1/dav' || strpos($requestPath, '/api/mobile/v1/dav/') === 0;
+    if ($hasBody && $method === 'PUT' && $isMobileDav
+        && !router_mobile_dav_bearer_authorized($headers)) {
+        router_reject_request_body($client, 401, 'Authentication required', $declaredLength);
+        return;
+    }
+    if (($headers['expect'] ?? '') !== '' && stripos($headers['expect'], '100-continue') !== false) {
+        fwrite($client, "HTTP/1.1 100 Continue\r\n\r\n");
+    }
     if (!$hasBody) {
         unset($GLOBALS['router_body_remainder']);
         router_execute_cgi($client, $cgiBinary, $method, $requestTarget, $protocol, $headers, null, 0, $host, $requestPort, $requestScheme, $requestRemote);
         return;
     }
 
-    $bodyFile = tempnam(sys_get_temp_dir(), 'clouddrive_request_');
+    $bodyDirectory = router_request_body_directory();
+    if ($bodyDirectory === null) {
+        router_write_simple_response($client, 500, 'Request storage is unavailable');
+        return;
+    }
+    $bodyFile = tempnam($bodyDirectory, 'clouddrive_request_');
     if ($bodyFile === false) {
         router_write_simple_response($client, 500, 'Could not buffer request');
         return;
     }
 
     try {
-        $config = router_load_config();
-        $maximumBodyBytes = max(1, (int)($config['max_request_body_mb'] ?? 10240)) * 1024 * 1024;
-        $bodyLength = router_read_body($client, $headers, $bodyFile, $maximumBodyBytes);
+        $bodyLength = router_read_body($client, $headers, $bodyFile, $routeMaximumBytes, $declaredLength);
         if ($bodyLength === -1) {
             router_write_simple_response($client, 413, 'Request body is too large');
             return;
@@ -1381,7 +1534,7 @@ function router_read_headers($client)
     return $headers;
 }
 
-function router_read_body($client, $headers, $bodyFile, $maximumBytes)
+function router_read_body($client, $headers, $bodyFile, $maximumBytes, $declaredLength)
 {
     $output = fopen($bodyFile, 'wb');
     if ($output === false) {
@@ -1392,7 +1545,7 @@ function router_read_body($client, $headers, $bodyFile, $maximumBytes)
     unset($GLOBALS['router_body_remainder']);
     $length = 0;
 
-    if (stripos($headers['transfer-encoding'] ?? '', 'chunked') !== false) {
+    if (strtolower(trim((string)($headers['transfer-encoding'] ?? ''))) === 'chunked') {
         while (true) {
             $line = router_read_line($client, $buffer);
             if ($line === null || !preg_match('/^([0-9a-fA-F]+)(?:;.*)?$/', trim($line), $match)) {
@@ -1401,8 +1554,13 @@ function router_read_body($client, $headers, $bodyFile, $maximumBytes)
             }
             $chunkLength = hexdec($match[1]);
             if ($chunkLength === 0) {
-                while (($trailer = router_read_line($client, $buffer)) !== null && $trailer !== '') {
-                }
+                do {
+                    $trailer = router_read_line($client, $buffer);
+                    if ($trailer === null) {
+                        fclose($output);
+                        return null;
+                    }
+                } while ($trailer !== '');
                 break;
             }
             if (!is_int($chunkLength) || $chunkLength < 0 || $chunkLength > $maximumBytes - $length) {
@@ -1418,11 +1576,7 @@ function router_read_body($client, $headers, $bodyFile, $maximumBytes)
             $length += $chunkLength;
         }
     } else {
-        $contentLength = (int)($headers['content-length'] ?? 0);
-        if ($contentLength < 0) {
-            fclose($output);
-            return null;
-        }
+        $contentLength = $declaredLength;
         if ($contentLength > $maximumBytes) {
             fclose($output);
             return -1;
@@ -1512,14 +1666,14 @@ function router_execute_cgi($client, $cgiBinary, $method, $requestTarget, $proto
         $GLOBALS['router_application_backend'] = $backend;
     }
     if (is_array($backend)) {
-        if (router_execute_application_backend($client, $backend['address'], $method, $url, $protocol, $headers, $bodyFile, $bodyLength, $scheme, $port, $remoteAddress)) {
+        if (router_execute_application_backend($client, $backend['address'], $backend['handoff_secret'] ?? '', $method, $url, $protocol, $headers, $bodyFile, $bodyLength, $scheme, $port, $remoteAddress)) {
             return;
         }
         router_stop_application_backend($backend);
         $backend = router_start_application_backend();
         $GLOBALS['router_application_backend'] = $backend;
         if (is_array($backend)
-            && router_execute_application_backend($client, $backend['address'], $method, $url, $protocol, $headers, $bodyFile, $bodyLength, $scheme, $port, $remoteAddress)) {
+            && router_execute_application_backend($client, $backend['address'], $backend['handoff_secret'] ?? '', $method, $url, $protocol, $headers, $bodyFile, $bodyLength, $scheme, $port, $remoteAddress)) {
             return;
         }
     }
@@ -1552,7 +1706,9 @@ function router_execute_cgi($client, $cgiBinary, $method, $requestTarget, $proto
     foreach ($headers as $name => $value) {
         if (in_array($name, [
             'content-type', 'content-length', 'x-clouddrive-remote-addr',
-            'x-clouddrive-proto', 'x-clouddrive-port',
+            'x-clouddrive-proto', 'x-clouddrive-port', 'x-clouddrive-body-path',
+            'x-clouddrive-body-length', 'x-clouddrive-body-signature', 'x-clouddrive-proxy-signature',
+            'x-clouddrive-backend-challenge',
         ], true)) {
             continue;
         }
@@ -1623,7 +1779,7 @@ function router_execute_cgi($client, $cgiBinary, $method, $requestTarget, $proto
     }
 }
 
-function router_execute_application_backend($client, $address, $method, $url, $protocol, $headers, $bodyFile, $bodyLength, $scheme, $port, $remoteAddress)
+function router_execute_application_backend($client, $address, $handoffSecret, $method, $url, $protocol, $headers, $bodyFile, $bodyLength, $scheme, $port, $remoteAddress)
 {
     $backend = @stream_socket_client('tcp://' . $address, $errorNumber, $errorMessage, 1);
     if ($backend === false) return false;
@@ -1632,9 +1788,31 @@ function router_execute_application_backend($client, $address, $method, $url, $p
 
     $target = $url['path'] ?? '/';
     if (isset($url['query']) && $url['query'] !== '') $target .= '?' . $url['query'];
+    $decodedTargetPath = rawurldecode((string)($url['path'] ?? '/'));
+    $isMobileDav = $decodedTargetPath === '/api/mobile/v1/dav'
+        || strpos($decodedTargetPath, '/api/mobile/v1/dav/') === 0;
+    $handoff = null;
+    if ($method === 'PUT' && $isMobileDav && $bodyLength > 0 && $handoffSecret !== '') {
+        $resolvedBody = realpath($bodyFile);
+        $bodyDirectory = router_request_body_directory();
+        $resolvedDirectory = $bodyDirectory !== null ? realpath($bodyDirectory) : false;
+        if ($resolvedBody !== false && $resolvedDirectory !== false && router_is_inside_root($resolvedBody, $resolvedDirectory)) {
+            $encodedPath = router_base64url_encode($resolvedBody);
+            $handoff = [
+                'path' => $encodedPath,
+                'length' => (string)$bodyLength,
+                'signature' => router_body_handoff_signature($handoffSecret, $method, $target, $bodyLength, $encodedPath),
+            ];
+        }
+    }
     $request = $method . ' ' . $target . ' HTTP/' . $protocol . "\r\n";
     foreach ($headers as $name => $value) {
-        if (in_array($name, ['connection', 'content-length', 'expect', 'transfer-encoding', 'x-clouddrive-remote-addr', 'x-clouddrive-proto', 'x-clouddrive-port'], true)) {
+        if (in_array($name, [
+            'connection', 'content-length', 'expect', 'transfer-encoding', 'x-clouddrive-remote-addr',
+            'x-clouddrive-proto', 'x-clouddrive-port', 'x-clouddrive-body-path',
+            'x-clouddrive-body-length', 'x-clouddrive-body-signature', 'x-clouddrive-proxy-signature',
+            'x-clouddrive-backend-challenge',
+        ], true)) {
             continue;
         }
         $request .= $name . ': ' . $value . "\r\n";
@@ -1644,7 +1822,14 @@ function router_execute_application_backend($client, $address, $method, $url, $p
     $request .= 'x-clouddrive-remote-addr: ' . $remoteAddress . "\r\n";
     $request .= 'x-clouddrive-proto: ' . $scheme . "\r\n";
     $request .= 'x-clouddrive-port: ' . (int)$port . "\r\n";
-    $request .= 'content-length: ' . $bodyLength . "\r\n";
+    $request .= 'x-clouddrive-proxy-signature: '
+        . router_proxy_signature($handoffSecret, $method, $target, $remoteAddress, $scheme, (int)$port) . "\r\n";
+    if ($handoff !== null) {
+        $request .= 'x-clouddrive-body-path: ' . $handoff['path'] . "\r\n";
+        $request .= 'x-clouddrive-body-length: ' . $handoff['length'] . "\r\n";
+        $request .= 'x-clouddrive-body-signature: ' . $handoff['signature'] . "\r\n";
+    }
+    $request .= 'content-length: ' . ($handoff !== null ? 0 : $bodyLength) . "\r\n";
     $request .= "connection: close\r\n\r\n";
 
     if (!router_write_all($backend, $request)) {
@@ -1652,7 +1837,7 @@ function router_execute_application_backend($client, $address, $method, $url, $p
         router_write_simple_response($client, 502, 'Application backend unavailable');
         return true;
     }
-    if ($bodyLength > 0) {
+    if ($handoff === null && $bodyLength > 0) {
         $input = @fopen($bodyFile, 'rb');
         if ($input === false) {
             fclose($backend);
@@ -1726,6 +1911,22 @@ function router_write_simple_response($client, $status, $message)
     @fwrite($client, "HTTP/1.1 $status $reason\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: " . strlen($body) . "\r\nConnection: close\r\n\r\n$body");
 }
 
+function router_reject_request_body($client, $status, $message, $declaredLength)
+{
+    router_write_simple_response($client, $status, $message);
+    @fflush($client);
+    @stream_socket_shutdown($client, STREAM_SHUT_WR);
+    $buffered = $GLOBALS['router_body_remainder'] ?? '';
+    unset($GLOBALS['router_body_remainder']);
+    $remaining = max(0, min((int)$declaredLength - strlen($buffered), 2 * 1024 * 1024));
+    stream_set_timeout($client, 1);
+    while ($remaining > 0 && !feof($client)) {
+        $chunk = fread($client, min(65536, $remaining));
+        if ($chunk === false || $chunk === '') break;
+        $remaining -= strlen($chunk);
+    }
+}
+
 function router_status_reason($status)
 {
     $reasons = [
@@ -1743,6 +1944,7 @@ function router_is_public_auth_path($requestPath)
 {
     $path = rtrim($requestPath, '/');
     if ($path === '') $path = '/';
+    if (strpos($path, '/assets/') === 0) return true;
     return in_array($path, [
         '/account.html',
         '/assets/style.css',
@@ -1800,21 +2002,102 @@ function router_require_root_access($requestPath, $requestMethod)
     exit;
 }
 
+function router_initialize_body_handoff($socketRemote)
+{
+    $encodedPath = trim((string)($_SERVER['HTTP_X_CLOUDDRIVE_BODY_PATH'] ?? ''));
+    $lengthHeader = trim((string)($_SERVER['HTTP_X_CLOUDDRIVE_BODY_LENGTH'] ?? ''));
+    $signature = strtolower(trim((string)($_SERVER['HTTP_X_CLOUDDRIVE_BODY_SIGNATURE'] ?? '')));
+    unset(
+        $_SERVER['HTTP_X_CLOUDDRIVE_BODY_PATH'],
+        $_SERVER['HTTP_X_CLOUDDRIVE_BODY_LENGTH'],
+        $_SERVER['HTTP_X_CLOUDDRIVE_BODY_SIGNATURE']
+    );
+
+    if ($encodedPath === '' && $lengthHeader === '' && $signature === '') return true;
+    $secret = getenv('CLOUDDRIVE_BODY_HANDOFF_SECRET');
+    $length = router_parse_decimal_length($lengthHeader);
+    if (!in_array($socketRemote, ['127.0.0.1', '::1'], true)
+        || $secret === false || $secret === ''
+        || $encodedPath === '' || $length === null
+        || !preg_match('/^[a-f0-9]{64}$/D', $signature)) {
+        return false;
+    }
+
+    $method = strtoupper((string)($_SERVER['REQUEST_METHOD'] ?? ''));
+    $target = (string)($_SERVER['REQUEST_URI'] ?? '/');
+    $expected = router_body_handoff_signature($secret, $method, $target, $length, $encodedPath);
+    if (!hash_equals($expected, $signature)) return false;
+
+    $decodedPath = router_base64url_decode($encodedPath);
+    $resolvedPath = $decodedPath !== false ? realpath($decodedPath) : false;
+    $bodyDirectory = router_request_body_directory();
+    $resolvedDirectory = $bodyDirectory !== null ? realpath($bodyDirectory) : false;
+    if ($resolvedPath === false || $resolvedDirectory === false || !is_file($resolvedPath)
+        || !router_is_inside_root($resolvedPath, $resolvedDirectory)
+        || filesize($resolvedPath) !== $length) {
+        return false;
+    }
+
+    $GLOBALS['router_body_handoff_path'] = $resolvedPath;
+    $GLOBALS['router_body_handoff_length'] = $length;
+    $_SERVER['CONTENT_LENGTH'] = (string)$length;
+    return true;
+}
+
 function router_dispatch_request()
 {
     $socketRemote = $_SERVER['REMOTE_ADDR'] ?? '';
-    $forwardedRemote = $_SERVER['HTTP_X_CLOUDDRIVE_REMOTE_ADDR'] ?? '';
-    if (in_array($socketRemote, ['127.0.0.1', '::1'], true) && filter_var($forwardedRemote, FILTER_VALIDATE_IP)) {
-        $_SERVER['REMOTE_ADDR'] = $forwardedRemote;
-        $forwardedScheme = strtolower((string)($_SERVER['HTTP_X_CLOUDDRIVE_PROTO'] ?? ''));
-        $forwardedPort = (int)($_SERVER['HTTP_X_CLOUDDRIVE_PORT'] ?? 0);
-        if (in_array($forwardedScheme, ['http', 'https'], true) && $forwardedPort >= 1 && $forwardedPort <= 65535) {
-            $_SERVER['REQUEST_SCHEME'] = $forwardedScheme;
-            $_SERVER['SERVER_PORT'] = (string)$forwardedPort;
-            $_SERVER['HTTPS'] = $forwardedScheme === 'https' ? 'on' : 'off';
+    $rawRequestPath = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
+    if ($rawRequestPath === '/__clouddrive_backend_ready') {
+        $challenge = trim((string)($_SERVER['HTTP_X_CLOUDDRIVE_BACKEND_CHALLENGE'] ?? ''));
+        $secret = getenv('CLOUDDRIVE_BODY_HANDOFF_SECRET');
+        if (in_array($socketRemote, ['127.0.0.1', '::1'], true) && $secret !== false && $secret !== ''
+            && preg_match('/^[a-f0-9]{32}$/D', $challenge)) {
+            $body = hash_hmac('sha256', "ready\n" . $challenge, $secret);
+            header('Content-Type: text/plain; charset=utf-8');
+            header('Content-Length: ' . strlen($body));
+            echo $body;
+            return;
         }
+        http_response_code(404);
+        return;
     }
-    unset($_SERVER['HTTP_X_CLOUDDRIVE_REMOTE_ADDR'], $_SERVER['HTTP_X_CLOUDDRIVE_PROTO'], $_SERVER['HTTP_X_CLOUDDRIVE_PORT']);
+    $forwardedRemote = $_SERVER['HTTP_X_CLOUDDRIVE_REMOTE_ADDR'] ?? '';
+    $forwardedScheme = strtolower((string)($_SERVER['HTTP_X_CLOUDDRIVE_PROTO'] ?? ''));
+    $forwardedPort = (int)($_SERVER['HTTP_X_CLOUDDRIVE_PORT'] ?? 0);
+    $forwardedSignature = strtolower(trim((string)($_SERVER['HTTP_X_CLOUDDRIVE_PROXY_SIGNATURE'] ?? '')));
+    $secret = getenv('CLOUDDRIVE_BODY_HANDOFF_SECRET');
+    $method = strtoupper((string)($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+    $target = (string)($_SERVER['REQUEST_URI'] ?? '/');
+    $trustedProxy = in_array($socketRemote, ['127.0.0.1', '::1'], true)
+        && $secret !== false && $secret !== ''
+        && filter_var($forwardedRemote, FILTER_VALIDATE_IP)
+        && in_array($forwardedScheme, ['http', 'https'], true)
+        && $forwardedPort >= 1 && $forwardedPort <= 65535
+        && preg_match('/^[a-f0-9]{64}$/D', $forwardedSignature)
+        && hash_equals(
+            router_proxy_signature($secret, $method, $target, $forwardedRemote, $forwardedScheme, $forwardedPort),
+            $forwardedSignature
+        );
+    if ($trustedProxy) {
+        $_SERVER['REMOTE_ADDR'] = $forwardedRemote;
+        $_SERVER['REQUEST_SCHEME'] = $forwardedScheme;
+        $_SERVER['SERVER_PORT'] = (string)$forwardedPort;
+        $_SERVER['HTTPS'] = $forwardedScheme === 'https' ? 'on' : 'off';
+    }
+    unset(
+        $_SERVER['HTTP_X_CLOUDDRIVE_REMOTE_ADDR'],
+        $_SERVER['HTTP_X_CLOUDDRIVE_PROTO'],
+        $_SERVER['HTTP_X_CLOUDDRIVE_PORT'],
+        $_SERVER['HTTP_X_CLOUDDRIVE_PROXY_SIGNATURE'],
+        $_SERVER['HTTP_X_CLOUDDRIVE_BACKEND_CHALLENGE']
+    );
+    if (!router_initialize_body_handoff($socketRemote)) {
+        http_response_code(400);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo "Invalid request body handoff\n";
+        return;
+    }
 
     $publicRoot = __DIR__ . DIRECTORY_SEPARATOR . 'public';
     $requestPath = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
@@ -1836,10 +2119,16 @@ function router_dispatch_request()
             'https_port' => (int)($httpsPort !== false && $httpsPort !== '' ? $httpsPort : ($config['https_port'] ?? 8443)),
             'certificate_url' => '/clouddrive.crt',
         ], JSON_UNESCAPED_SLASHES);
+        $etag = '"server-info-' . hash('sha256', $payload) . '"';
         header('Content-Type: application/json; charset=utf-8');
-        header('Cache-Control: no-store');
+        header('Cache-Control: public, max-age=300, stale-while-revalidate=86400');
+        header('ETag: ' . $etag);
+        if (trim($_SERVER['HTTP_IF_NONE_MATCH'] ?? '') === $etag) {
+            http_response_code(304);
+            return;
+        }
         header('Content-Length: ' . strlen($payload));
-        echo $payload;
+        if ($requestMethod !== 'HEAD') echo $payload;
         return;
     }
     if ($requestPath === '/clouddrive.crt') {
@@ -1952,11 +2241,7 @@ function router_dispatch_request()
 
     $indexFile = $publicRoot . DIRECTORY_SEPARATOR . 'index.html';
     if (is_file($indexFile)) {
-        header('Content-Type: text/html; charset=utf-8');
-        header('Content-Length: ' . filesize($indexFile));
-        if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'HEAD') {
-            readfile($indexFile);
-        }
+        router_send_file($indexFile, ($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'HEAD');
         return;
     }
 
@@ -2373,10 +2658,26 @@ function router_send_file($file, $head = false)
     if ($mime === false && function_exists('mime_content_type')) {
         $mime = @mime_content_type($file);
     }
+    $stat = @stat($file);
+    if ($stat === false) {
+        http_response_code(404);
+        return;
+    }
+    $etag = 'W/"' . dechex((int)$stat['mtime']) . '-' . dechex((int)$stat['size']) . '"';
+    $versioned = isset($_GET['v']) && preg_match('/^[A-Za-z0-9._-]{1,64}$/', (string)$_GET['v']);
     header('Content-Type: ' . ($mime ?: 'application/octet-stream'));
     header('X-Content-Type-Options: nosniff');
-    header('Content-Length: ' . filesize($file));
-    header('Last-Modified: ' . gmdate('D, d M Y H:i:s', filemtime($file)) . ' GMT');
+    header('Cache-Control: ' . ($versioned ? 'public, max-age=31536000, immutable' : 'public, no-cache'));
+    header('ETag: ' . $etag);
+    header('Last-Modified: ' . gmdate('D, d M Y H:i:s', (int)$stat['mtime']) . ' GMT');
+    $ifNoneMatch = trim((string)($_SERVER['HTTP_IF_NONE_MATCH'] ?? ''));
+    $ifModifiedSince = strtotime((string)($_SERVER['HTTP_IF_MODIFIED_SINCE'] ?? ''));
+    if (($ifNoneMatch !== '' && ($ifNoneMatch === '*' || $ifNoneMatch === $etag))
+        || ($ifNoneMatch === '' && $ifModifiedSince !== false && $ifModifiedSince >= (int)$stat['mtime'])) {
+        http_response_code(304);
+        return;
+    }
+    header('Content-Length: ' . (int)$stat['size']);
     if (!$head) {
         readfile($file);
     }
@@ -2397,7 +2698,6 @@ function handle_webdav($requestPath, $mountPath = '/drive')
 
     header('DAV: 1, 2');
     header('MS-Author-Via: DAV');
-    header('X-MSDAVEXT: 1');
     header('Accept-Ranges: bytes');
 
     if ($target === null) {
@@ -2640,7 +2940,14 @@ function webdav_destination_lock($target)
     if (!is_dir($directory)) {
         @mkdir($directory, 0755, true);
     }
-    $handle = @fopen($directory . DIRECTORY_SEPARATOR . hash('sha256', $target) . '.lock', 'c');
+    $lockTarget = str_replace('\\', '/', $target);
+    if (DIRECTORY_SEPARATOR === '\\') {
+        $segments = array_map(static function ($segment) {
+            return strtolower(rtrim($segment, " ."));
+        }, explode('/', $lockTarget));
+        $lockTarget = implode('/', $segments);
+    }
+    $handle = @fopen($directory . DIRECTORY_SEPARATOR . hash('sha256', $lockTarget) . '.lock', 'c');
     if ($handle === false || !flock($handle, LOCK_EX)) {
         if (is_resource($handle)) fclose($handle);
         webdav_status(500, 'Could not lock destination');
@@ -2654,6 +2961,58 @@ function webdav_destination_unlock($handle)
         flock($handle, LOCK_UN);
         fclose($handle);
     }
+}
+
+function webdav_read_exact_stream($stream, $length)
+{
+    $data = '';
+    while (strlen($data) < $length) {
+        $chunk = fread($stream, min(65536, $length - strlen($data)));
+        if ($chunk === false || $chunk === '') return false;
+        $data .= $chunk;
+    }
+    return $data;
+}
+
+function webdav_parse_hex_length($value, $maximum = null)
+{
+    if (!is_string($value) || strlen($value) !== 16 || !preg_match('/^[0-9a-fA-F]{16}$/D', $value)) return null;
+    $normalized = ltrim(strtolower($value), '0');
+    if ($normalized === '') return 0;
+    $integerMaximum = strtolower(dechex(PHP_INT_MAX));
+    if (strlen($normalized) > strlen($integerMaximum)
+        || (strlen($normalized) === strlen($integerMaximum) && strcmp($normalized, $integerMaximum) > 0)) {
+        return null;
+    }
+    $length = intval($normalized, 16);
+    return $maximum !== null && $length > $maximum ? null : $length;
+}
+
+function webdav_validate_msdav_properties($properties)
+{
+    $xml = rtrim($properties, "\0");
+    if ($xml === '' || strlen($xml) > 1024 * 1024 || stripos($xml, '<!DOCTYPE') !== false
+        || preg_match('//u', $xml) !== 1) {
+        return false;
+    }
+    if (!class_exists('DOMDocument')) {
+        return preg_match('/<(?:(?:[A-Za-z_][A-Za-z0-9_.-]*):)?propertyupdate\b/i', $xml) === 1;
+    }
+    $previous = libxml_use_internal_errors(true);
+    $document = new DOMDocument();
+    $loaded = $document->loadXML($xml, LIBXML_NONET | LIBXML_COMPACT);
+    libxml_clear_errors();
+    libxml_use_internal_errors($previous);
+    return $loaded && $document->documentElement !== null
+        && strtolower($document->documentElement->localName) === 'propertyupdate'
+        && $document->documentElement->namespaceURI === 'DAV:';
+}
+
+function webdav_is_msdav_prefix_encoded()
+{
+    $contentType = strtolower(trim(explode(';', (string)($_SERVER['CONTENT_TYPE'] ?? ''))[0]));
+    $extension = strtoupper(trim((string)($_SERVER['HTTP_X_MSDAVEXT'] ?? '')));
+    return $contentType === 'multipart/msdavextprefixencoded' && $extension === 'PROPPATCH';
 }
 
 function webdav_put($target)
@@ -2674,24 +3033,74 @@ function webdav_put($target)
     if ($existed && trim($_SERVER['HTTP_IF_NONE_MATCH'] ?? '') === '*') {
         webdav_status(412, 'Destination already exists');
     }
-    $input = fopen('php://input', 'rb');
     $temp = dirname($target) . DIRECTORY_SEPARATOR . '.clouddrive-stage-upload-' . bin2hex(random_bytes(6));
-    $output = @fopen($temp, 'xb');
-    if ($input === false || $output === false) {
-        if (is_resource($input)) {
-            fclose($input);
+    $expectedHeader = trim((string)($_SERVER['CONTENT_LENGTH'] ?? ''));
+    $expected = $expectedHeader === '' ? null : router_parse_decimal_length($expectedHeader);
+    if ($expectedHeader !== '' && $expected === null) webdav_status(400, 'Invalid Content-Length');
+    $handoffPath = $GLOBALS['router_body_handoff_path'] ?? null;
+    $handoffLength = $GLOBALS['router_body_handoff_length'] ?? null;
+    unset($GLOBALS['router_body_handoff_path'], $GLOBALS['router_body_handoff_length']);
+    $copied = false;
+    $expectedFileSize = $expected;
+
+    if (is_string($handoffPath) && is_int($handoffLength) && $expected === $handoffLength
+        && is_file($handoffPath) && @filesize($handoffPath) === $handoffLength) {
+        $sourceStat = @stat($handoffPath);
+        $destinationStat = @stat(dirname($target));
+        $sameDevice = is_array($sourceStat) && is_array($destinationStat)
+            && isset($sourceStat['dev'], $destinationStat['dev'])
+            && $sourceStat['dev'] === $destinationStat['dev'];
+        if ($sameDevice && @rename($handoffPath, $temp)) {
+            $copied = $handoffLength;
+        } else {
+            $input = @fopen($handoffPath, 'rb');
+            $output = @fopen($temp, 'xb');
+            if ($input !== false && $output !== false) {
+                $copied = stream_copy_to_stream($input, $output);
+                if (!fflush($output)) $copied = false;
+            }
+            if (is_resource($input)) fclose($input);
+            if (is_resource($output) && !fclose($output)) $copied = false;
         }
-        @unlink($temp);
-        webdav_status(500, 'Could not open destination');
+    } else {
+        $input = fopen('php://input', 'rb');
+        if ($input !== false && webdav_is_msdav_prefix_encoded()) {
+            $propertyLengthBytes = webdav_read_exact_stream($input, 16);
+            $propertyLength = $propertyLengthBytes === false
+                ? null
+                : webdav_parse_hex_length($propertyLengthBytes, 1024 * 1024);
+            $properties = $propertyLength === null ? false : webdav_read_exact_stream($input, $propertyLength);
+            $fileLengthBytes = $properties === false ? false : webdav_read_exact_stream($input, 16);
+            $fileLength = $fileLengthBytes === false ? null : webdav_parse_hex_length($fileLengthBytes);
+            $wrapperLength = $fileLength === null || $propertyLength > PHP_INT_MAX - 32 - $fileLength
+                ? null
+                : 32 + $propertyLength + $fileLength;
+            if ($propertyLength === null || $properties === false || !webdav_validate_msdav_properties($properties)
+                || $fileLength === null || $wrapperLength === null || $expected !== $wrapperLength) {
+                fclose($input);
+                webdav_status(400, 'Invalid Microsoft WebDAV PUT body');
+            }
+            $expectedFileSize = $fileLength;
+        }
+        $output = @fopen($temp, 'xb');
+        if ($input !== false && $output !== false) {
+            $copied = $expectedFileSize === null
+                ? stream_copy_to_stream($input, $output)
+                : stream_copy_to_stream($input, $output, $expectedFileSize);
+            if (webdav_is_msdav_prefix_encoded() && $copied !== false && fread($input, 1) !== '') $copied = false;
+            if (!fflush($output)) $copied = false;
+        }
+        if (is_resource($input)) fclose($input);
+        if (is_resource($output) && !fclose($output)) $copied = false;
     }
-    $copied = stream_copy_to_stream($input, $output);
-    fclose($input);
-    fclose($output);
-    $expected = isset($_SERVER['CONTENT_LENGTH']) ? (int)$_SERVER['CONTENT_LENGTH'] : null;
-    if ($copied === false || ($expected !== null && $copied !== $expected)) {
+    clearstatcache(true, $temp);
+    $stageSize = @filesize($temp);
+    if ($copied === false || $stageSize === false || $stageSize !== $copied
+        || ($expectedFileSize !== null && $copied !== $expectedFileSize)) {
         @unlink($temp);
         webdav_status(500, 'Could not write file');
     }
+    @chmod($temp, 0644);
 
     if (!$existed && trim($_SERVER['HTTP_IF_NONE_MATCH'] ?? '') === '*' && file_exists($target)) {
         @unlink($temp);
@@ -2699,7 +3108,7 @@ function webdav_put($target)
     }
 
     $backup = null;
-    if ($existed) {
+    if ($existed && DIRECTORY_SEPARATOR === '\\') {
         $backup = dirname($target) . DIRECTORY_SEPARATOR . '.clouddrive-stage-backup-' . bin2hex(random_bytes(6));
         if (!@rename($target, $backup)) {
             @unlink($temp);
@@ -2770,7 +3179,20 @@ function webdav_move_or_copy($source, $sourceRelative, $move)
     }
 
     $existed = file_exists($destination);
-    $overwrite = strtoupper($_SERVER['HTTP_OVERWRITE'] ?? 'T') !== 'F';
+    $conflictPolicy = strtolower(trim((string)($_SERVER['HTTP_X_CLOUDDRIVE_CONFLICT'] ?? '')));
+    if ($conflictPolicy !== '' && !in_array($conflictPolicy, ['skip', 'overwrite', 'keep-newer'], true)) {
+        webdav_destination_unlock($destinationLock);
+        webdav_status(400, 'Invalid conflict policy');
+    }
+    if ($existed && ($conflictPolicy === 'skip' || ($conflictPolicy === 'keep-newer'
+        && (@filemtime($source) ?: 0) <= (@filemtime($destination) ?: 0)))) {
+        header('X-CloudDrive-Conflict-Result: skipped');
+        webdav_destination_unlock($destinationLock);
+        http_response_code(204);
+        return;
+    }
+    $overwrite = $conflictPolicy === 'overwrite' || $conflictPolicy === 'keep-newer'
+        || strtoupper($_SERVER['HTTP_OVERWRITE'] ?? 'T') !== 'F';
     if ($existed && !$overwrite) {
         webdav_status(412, 'Destination exists');
     }
@@ -2803,6 +3225,7 @@ function webdav_move_or_copy($source, $sourceRelative, $move)
     webdav_changed(dirname($source));
     webdav_changed(dirname($destination));
     webdav_destination_unlock($destinationLock);
+    header('X-CloudDrive-Conflict-Result: ' . ($existed ? 'overwritten' : ($move ? 'moved' : 'copied')));
     http_response_code($existed ? 204 : 201);
 }
 

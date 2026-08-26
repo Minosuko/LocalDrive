@@ -11,6 +11,29 @@ function mobile_storage_root() {
         : mobile_project_root() . DIRECTORY_SEPARATOR . 'storage';
 }
 
+function mobile_max_request_body_bytes() {
+    static $maximum = null;
+    if ($maximum !== null) return $maximum;
+    $config = json_decode((string)@file_get_contents(mobile_project_root() . DIRECTORY_SEPARATOR . 'config.json'), true);
+    $megabytes = is_array($config) ? (int)($config['max_request_body_mb'] ?? 10240) : 10240;
+    $maximumMegabytes = intdiv(PHP_INT_MAX, 1024 * 1024);
+    return $maximum = min(max(1, $megabytes), $maximumMegabytes) * 1024 * 1024;
+}
+
+function mobile_content_length() {
+    $value = trim((string)($_SERVER['CONTENT_LENGTH'] ?? ''));
+    if ($value === '') return 0;
+    if (!preg_match('/^\d+$/D', $value)) mobile_error('Invalid Content-Length', 400);
+    $normalized = ltrim($value, '0');
+    if ($normalized === '') return 0;
+    $maximum = (string)PHP_INT_MAX;
+    if (strlen($normalized) > strlen($maximum)
+        || (strlen($normalized) === strlen($maximum) && strcmp($normalized, $maximum) > 0)) {
+        mobile_error('Request body is too large', 413);
+    }
+    return (int)$normalized;
+}
+
 function mobile_db() {
     static $database = null;
     if ($database instanceof PDO) return $database;
@@ -115,17 +138,21 @@ function mobile_initialize($requireAuthentication = true) {
         http_response_code(204);
         exit;
     }
-    $length = (int)($_SERVER['CONTENT_LENGTH'] ?? 0);
-    if ($length > 0 && $length > 1024 * 1024 * 1024) mobile_error('Request body is too large', 413);
+    $length = mobile_content_length();
+    if ($length > mobile_max_request_body_bytes()) mobile_error('Request body is too large', 413);
     $principal = $requireAuthentication ? mobile_require_principal() : null;
     if ($principal) $GLOBALS['clouddrive_root_principal'] = $principal;
     return $principal;
 }
 
 function mobile_json_input($maximumBytes = 65536) {
-    $length = (int)($_SERVER['CONTENT_LENGTH'] ?? 0);
+    $length = mobile_content_length();
     if ($length > $maximumBytes) mobile_error('Request body is too large', 413);
-    $raw = file_get_contents('php://input');
+    $input = fopen('php://input', 'rb');
+    $raw = $input === false ? false : stream_get_contents($input, $maximumBytes + 1);
+    if (is_resource($input)) fclose($input);
+    if ($raw === false || strlen($raw) > $maximumBytes) mobile_error('Request body is too large', 413);
+    if ($length > 0 && strlen($raw) !== $length) mobile_error('Invalid request body', 400);
     $data = json_decode($raw === false ? '' : $raw, true);
     if (!is_array($data)) mobile_error('Invalid JSON body', 400);
     return $data;
@@ -457,8 +484,8 @@ function mobile_basic_principal($authorization = null) {
             return null;
         }
         mobile_remember_basic_auth($authorization, $user);
+        $database->prepare('DELETE FROM login_attempts WHERE key_hash = ?')->execute([$attemptKey]);
     }
-    $database->prepare('DELETE FROM login_attempts WHERE key_hash = ?')->execute([$attemptKey]);
     return [
         'session_id' => null,
         'user_id' => $user['id'],
