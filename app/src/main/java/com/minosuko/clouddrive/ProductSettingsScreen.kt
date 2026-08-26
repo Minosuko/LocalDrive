@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.CheckCircle
+import androidx.compose.material.icons.outlined.Block
 import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.Folder
@@ -46,12 +47,24 @@ fun ProductSettingsScreen(theme: ThemeMode, onThemeChanged: (ThemeMode) -> Unit)
     val context = androidx.compose.ui.platform.LocalContext.current
     var syncOpen by remember { mutableStateOf(false) }
     var accountsOpen by remember { mutableStateOf(false) }
+    var smsBlacklistOpen by remember { mutableStateOf(false) }
+    var blockedSenderCount by remember { mutableIntStateOf(SmsBlocklistStore.count(context)) }
     if (syncOpen) {
         SyncSettingsScreen(onBack = { syncOpen = false })
         return
     }
     if (accountsOpen) {
         AccountManagementScreen(onBack = { accountsOpen = false })
+        return
+    }
+    if (smsBlacklistOpen) {
+        SmsBlacklistScreen(
+            onBack = {
+                blockedSenderCount = SmsBlocklistStore.count(context)
+                smsBlacklistOpen = false
+            },
+            onCountChanged = { blockedSenderCount = it },
+        )
         return
     }
 
@@ -120,6 +133,28 @@ fun ProductSettingsScreen(theme: ThemeMode, onThemeChanged: (ThemeMode) -> Unit)
                         )
                     }
                     Icon(Icons.Outlined.ChevronRight, "Open Account management")
+                }
+            }
+        }
+        item { SectionHeading("Messages") }
+        item {
+            ProductCard(Modifier.clickable { smsBlacklistOpen = true }) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Outlined.Block, null, tint = MaterialTheme.colorScheme.primary)
+                    Spacer(Modifier.size(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("Blocked SMS senders", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            when (blockedSenderCount) {
+                                0 -> "No blocked senders"
+                                1 -> "1 sender blocked on this device"
+                                else -> "$blockedSenderCount senders blocked on this device"
+                            },
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontSize = 12.sp,
+                        )
+                    }
+                    Icon(Icons.Outlined.ChevronRight, "Open blocked SMS senders")
                 }
             }
         }

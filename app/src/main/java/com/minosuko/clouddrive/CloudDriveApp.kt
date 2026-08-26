@@ -3,6 +3,8 @@ package com.minosuko.clouddrive
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.core.tween
@@ -25,6 +27,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.navigation.NavGraph.Companion.findStartDestination
@@ -70,8 +73,10 @@ fun CloudDriveRoot(
         bottomBar = {
             AnimatedVisibility(
                 visible = currentRoute != RootDestination.Photos.route || photosChromeVisible,
-                enter = slideInVertically { it } + fadeIn(),
-                exit = slideOutVertically { it } + fadeOut(),
+                enter = expandVertically(animationSpec = tween(220), expandFrom = Alignment.Bottom) +
+                    slideInVertically(animationSpec = tween(220)) { it } + fadeIn(tween(160)),
+                exit = shrinkVertically(animationSpec = tween(200), shrinkTowards = Alignment.Bottom) +
+                    slideOutVertically(animationSpec = tween(200)) { it } + fadeOut(tween(140)),
             ) {
                 NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
                     RootDestination.entries.forEach { destination ->

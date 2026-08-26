@@ -93,8 +93,11 @@ fun SyncSettingsScreen(onBack: () -> Unit) {
     var backupDevices by remember { mutableStateOf(emptyList<String>()) }
     var loadingBackups by remember { mutableStateOf(false) }
     var backupLoadError by remember { mutableStateOf<String?>(null) }
-    val drives = AppSettings.drives(context)
-    val signedInDriveIds = drives.filter { AccountStore.hasSession(context, it.id) }.mapTo(hashSetOf()) { it.id }
+    val appContext = context.applicationContext
+    val drives = remember(appContext) { AppSettings.drives(appContext) }
+    val signedInDriveIds = remember(drives, permissionVersion) {
+        drives.filter { AccountStore.hasSession(appContext, it.id) }.mapTo(hashSetOf()) { it.id }
+    }
     val selectedDrive = drives.firstOrNull { it.id == syncDriveId }
     val cloudAccountReady = if (selectedDrive == null) signedInDriveIds.isNotEmpty() else selectedDrive.id in signedInDriveIds
 
@@ -107,9 +110,10 @@ fun SyncSettingsScreen(onBack: () -> Unit) {
     }
     val selectedAccess = selectedCategories.all { categoryAccess[it] == true }
 
-    val work by WorkManager.getInstance(context)
-        .getWorkInfosForUniqueWorkLiveData(AppSettings.MANUAL_WORK)
-        .observeAsState(emptyList())
+    val workLiveData = remember(appContext) {
+        WorkManager.getInstance(appContext).getWorkInfosForUniqueWorkLiveData(AppSettings.MANUAL_WORK)
+    }
+    val work by workLiveData.observeAsState(emptyList())
     val info = work.lastOrNull()
     val running = info?.state in setOf(WorkInfo.State.RUNNING, WorkInfo.State.ENQUEUED, WorkInfo.State.BLOCKED)
     val done = info?.progress?.getInt(MediaSyncWorker.KEY_DONE, 0) ?: 0
@@ -122,6 +126,7 @@ fun SyncSettingsScreen(onBack: () -> Unit) {
             else AppSettings.lastSyncStatus(context, direction) ?: if (direction == SyncDirection.DeviceToCloud) "Ready to back up" else "Ready to restore"
         WorkInfo.State.FAILED -> if (completedForCurrentDirection) info.outputData.getString(MediaSyncWorker.KEY_MESSAGE) ?: "Sync needs attention"
             else AppSettings.lastSyncStatus(context, direction) ?: if (direction == SyncDirection.DeviceToCloud) "Ready to back up" else "Ready to restore"
+        WorkInfo.State.CANCELLED -> "Sync cancelled"
         else -> AppSettings.lastSyncStatus(context, direction) ?: if (direction == SyncDirection.DeviceToCloud) "Ready to back up" else "Ready to restore"
     }
     val blockedReason = when {
@@ -129,33 +134,43 @@ fun SyncSettingsScreen(onBack: () -> Unit) {
         !cloudAccountReady -> if (selectedDrive == null) "Sign in to at least one CloudDrive" else "Sign in to ${selectedDrive.name}"
         selectedCategories.isEmpty() -> "Select at least one data type"
         !selectedAccess -> "Allow access for each selected data type"
+        direction == SyncDirection.CloudToDevice && loadingBackups -> "Finding device backups..."
         else -> null
     }
 
-    LaunchedEffect(direction, syncDriveId, drives) {
+    LaunchedEffect(direction, syncDriveId, drives, signedInDriveIds) {
         if (direction != SyncDirection.CloudToDevice) {
             backupDevices = emptyList()
             backupLoadError = null
             loadingBackups = false
             return@LaunchedEffect
         }
-        val drive = drives.firstOrNull { it.id == syncDriveId } ?: drives.firstOrNull()
+        val drive = drives.firstOrNull { it.id == syncDriveId && it.id in signedInDriveIds }
+            ?: drives.firstOrNull { it.id in signedInDriveIds }
         if (drive == null) {
             backupDevices = emptyList()
-            backupLoadError = "Add a CloudDrive first"
+            backupLoadError = "Sign in to a CloudDrive first"
             return@LaunchedEffect
         }
         loadingBackups = true
         backupLoadError = null
         val result = withContext(Dispatchers.IO) {
             runCatching {
-                davClient(context, drive).listCloud(listOf("Sync"), force = true)
+                val client = davClient(context, drive)
+                client.listCloud(listOf("Sync"), force = true)
                     .filter(BrowserEntry::isDirectory)
+                    .filter { client.exists(it.cloudSegments + MediaSyncWorker.BACKUP_COMPLETE_MARKER) }
                     .map(BrowserEntry::name)
                     .sortedWith(String.CASE_INSENSITIVE_ORDER)
             }
         }
-        result.onSuccess { backupDevices = it }
+        result.onSuccess {
+            backupDevices = it
+            if (restoreDevice.isNotBlank() && restoreDevice !in it) {
+                restoreDevice = ""
+                AppSettings.saveRestoreDevice(context, "")
+            }
+        }
             .onFailure {
                 backupDevices = emptyList()
                 backupLoadError = if (it is DavException && it.status == 404) {
@@ -438,12 +453,19 @@ fun SyncSettingsScreen(onBack: () -> Unit) {
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.padding(bottom = 5.dp),
                 )
-                Button(
-                    onClick = { enqueueMediaSync(context) },
-                    enabled = !running && blockedReason == null,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text(if (direction == SyncDirection.DeviceToCloud) "Sync to CloudDrive" else "Sync to device")
+                if (running) {
+                    OutlinedButton(
+                        onClick = { WorkManager.getInstance(appContext).cancelUniqueWork(AppSettings.MANUAL_WORK) },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("Cancel sync") }
+                } else {
+                    Button(
+                        onClick = { enqueueMediaSync(context) },
+                        enabled = blockedReason == null,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(if (direction == SyncDirection.DeviceToCloud) "Sync to CloudDrive" else "Sync to device")
+                    }
                 }
             }
         }

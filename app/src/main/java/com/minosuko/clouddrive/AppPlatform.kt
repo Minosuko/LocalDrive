@@ -82,7 +82,8 @@ fun syncDeviceFolder(context: Context): String {
 }
 
 fun sanitizeCloudSegment(value: String): String {
-    val cleaned = value.replace(Regex("[<>:\"/\\\\|?*\\x00-\\x1f]"), "_").trim().trim('.')
+    val cleaned = value.replace(Regex("[<>:\"/\\\\|?*\\x00-\\x1f]"), "_")
+        .trim { it == '.' || it.isWhitespace() }
     val named = cleaned.ifEmpty { "Unnamed" }
     return if (named.startsWith(".clouddrive-stage-", ignoreCase = true)) "_$named" else named
 }

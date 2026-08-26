@@ -43,6 +43,10 @@ data class FileBrowserState(
     val clipboard: FileClipboard? = null,
     val viewer: ViewerContent? = null,
     val imageViewer: ImageGalleryContent? = null,
+    val archiveViewer: ArchiveViewerContent? = null,
+    val archiveLoading: Boolean = false,
+    val externalOpen: PreparedExternalFile? = null,
+    val selectedIds: Set<String> = emptySet(),
 ) {
     val visibleItems: List<BrowserEntry>
         get() {
@@ -54,6 +58,8 @@ data class FileBrowserState(
             }
             return filtered.sortedWith(compareByDescending<BrowserEntry> { it.isDirectory }.then(comparator))
         }
+    val selectedItems: List<BrowserEntry>
+        get() = items.filter { it.id in selectedIds }
 }
 
 data class FileTransferProgress(
@@ -138,6 +144,7 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
                         clipboard = state.clipboard?.takeUnless { it.entry.driveProfileId == drive.id },
                         viewer = null,
                         imageViewer = null,
+                        archiveViewer = null,
                         operationRunning = false,
                         error = null,
                         message = "${session.displayName} signed in to ${drive.name}",
@@ -167,6 +174,7 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
                 clipboard = state.clipboard?.takeUnless { it.entry.driveProfileId == id },
                 viewer = null,
                 imageViewer = null,
+                archiveViewer = null,
                 message = "${profile.name} disconnected",
             )
         }
@@ -176,7 +184,9 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
     fun setSource(source: BrowserSource) {
         if (mutableState.value.source == source) return
         prefetchJob?.cancel()
-        mutableState.update { it.copy(source = source, items = emptyList(), viewer = null, imageViewer = null, error = null) }
+        mutableState.update {
+            it.copy(source = source, items = emptyList(), viewer = null, imageViewer = null, archiveViewer = null, selectedIds = emptySet(), error = null)
+        }
         refresh()
     }
 
@@ -189,17 +199,30 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
         prefetchJob?.cancel()
         if (entry.isDirectory) {
             mutableState.update {
-                if (entry.driveRoot) it.copy(activeDriveId = entry.driveProfileId, cloudPath = emptyList(), items = emptyList(), query = "", viewer = null, imageViewer = null)
-                else if (entry.source == BrowserSource.CloudDrive) it.copy(cloudPath = entry.cloudSegments, items = emptyList(), query = "", viewer = null, imageViewer = null)
-                else it.copy(deviceStack = it.deviceStack + requireNotNull(entry.devicePath), items = emptyList(), query = "", viewer = null, imageViewer = null)
+                if (entry.driveRoot) it.copy(activeDriveId = entry.driveProfileId, cloudPath = emptyList(), items = emptyList(), query = "", viewer = null, imageViewer = null, archiveViewer = null, selectedIds = emptySet())
+                else if (entry.source == BrowserSource.CloudDrive) it.copy(cloudPath = entry.cloudSegments, items = emptyList(), query = "", viewer = null, imageViewer = null, archiveViewer = null, selectedIds = emptySet())
+                else it.copy(deviceStack = it.deviceStack + requireNotNull(entry.devicePath), items = emptyList(), query = "", viewer = null, imageViewer = null, archiveViewer = null, selectedIds = emptySet())
             }
             refresh()
         } else {
+            if (entry.extension == "apk") {
+                prepareExternalOpen(entry, installPackage = true)
+                return
+            }
+            if (entry.extension in ARCHIVE_EXTENSIONS) {
+                openArchive(entry)
+                return
+            }
             val current = mutableState.value
-            val viewer = createViewer(entry)
+            val cloudClient = if (entry.source == BrowserSource.CloudDrive) davClient(context, driveFor(entry)) else null
+            val viewer = createViewer(entry, cloudClient)
+            if (viewer == null) {
+                prepareExternalOpen(entry, installPackage = false)
+                return
+            }
             val gallery = if (viewer?.kind == ViewerKind.Image) {
                 val images = current.visibleItems.mapNotNull { candidate ->
-                    createViewer(candidate)?.takeIf { it.kind == ViewerKind.Image }
+                    createViewer(candidate, cloudClient)?.takeIf { it.kind == ViewerKind.Image }
                 }
                 ImageGalleryContent(
                     images = images,
@@ -210,20 +233,84 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
                 it.copy(
                     viewer = viewer?.takeUnless { content -> content.kind == ViewerKind.Image },
                     imageViewer = gallery,
-                    message = if (viewer == null) "No viewer for this file type" else null,
+                    message = null,
                 )
             }
         }
     }
 
+    fun openWith(entry: BrowserEntry) {
+        if (!entry.isDirectory) prepareExternalOpen(entry, installPackage = entry.extension == "apk")
+    }
+
+    private fun prepareExternalOpen(entry: BrowserEntry, installPackage: Boolean) {
+        if (mutableState.value.operationRunning) return
+        viewModelScope.launch {
+            mutableState.update {
+                it.copy(
+                    operationRunning = true,
+                    transferProgress = FileTransferProgress(if (installPackage) "Preparing installer" else "Preparing ${entry.name}", totalBytes = entry.size.takeIf { size -> size > 0 }),
+                    externalOpen = null,
+                    error = null,
+                    message = null,
+                )
+            }
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    if (entry.source == BrowserSource.Device) {
+                        prepareDeviceExternalFile(context, entry, installPackage)
+                    } else {
+                        stageCloudExternalFile(context, davClient(context, driveFor(entry)), entry, installPackage) { bytes ->
+                            reportTransfer(bytes, entry.size.takeIf { size -> size > 0 })
+                        }
+                    }
+                }
+            }.onSuccess { prepared ->
+                mutableState.update {
+                    it.copy(operationRunning = false, transferProgress = null, externalOpen = prepared)
+                }
+            }.onFailure { error ->
+                mutableState.update {
+                    it.copy(operationRunning = false, transferProgress = null, message = error.message ?: "Could not open file")
+                }
+            }
+        }
+    }
+
     fun up() {
+        val current = mutableState.value
+        val canMoveUp = current.source == BrowserSource.CloudDrive && current.activeDriveId != null ||
+            current.source == BrowserSource.Device && current.deviceStack.size > 1
+        if (!canMoveUp) return
         prefetchJob?.cancel()
         mutableState.update {
-            if (it.source == BrowserSource.CloudDrive && it.cloudPath.isEmpty()) it.copy(activeDriveId = null, items = emptyList(), query = "", viewer = null, imageViewer = null)
-            else if (it.source == BrowserSource.CloudDrive) it.copy(cloudPath = it.cloudPath.dropLast(1), items = emptyList(), query = "", viewer = null, imageViewer = null)
-            else it.copy(deviceStack = it.deviceStack.dropLast(1), items = emptyList(), query = "", viewer = null, imageViewer = null)
+            if (it.source == BrowserSource.CloudDrive && it.cloudPath.isEmpty()) it.copy(activeDriveId = null, items = emptyList(), query = "", viewer = null, imageViewer = null, selectedIds = emptySet())
+            else if (it.source == BrowserSource.CloudDrive) it.copy(cloudPath = it.cloudPath.dropLast(1), items = emptyList(), query = "", viewer = null, imageViewer = null, selectedIds = emptySet())
+            else it.copy(deviceStack = it.deviceStack.dropLast(1), items = emptyList(), query = "", viewer = null, imageViewer = null, selectedIds = emptySet())
         }
         refresh()
+    }
+
+    private fun openArchive(entry: BrowserEntry) {
+        if (mutableState.value.archiveLoading) return
+        viewModelScope.launch {
+            mutableState.update { it.copy(archiveLoading = true, archiveViewer = null, error = null, message = null) }
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    if (entry.source == BrowserSource.Device) {
+                        readLocalArchive(File(requireNotNull(entry.devicePath)))
+                    } else {
+                        davClient(context, driveFor(entry)).listArchive(entry.cloudSegments)
+                    }
+                }
+            }.onSuccess { content ->
+                mutableState.update { it.copy(archiveLoading = false, archiveViewer = content) }
+            }.onFailure { error ->
+                mutableState.update {
+                    it.copy(archiveLoading = false, message = error.message ?: "Could not read archive")
+                }
+            }
+        }
     }
 
     fun refresh() = load(force = false)
@@ -271,7 +358,9 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
                 }
             }.onSuccess { items ->
                 mutableState.update {
-                    if (it.locationKey() == requestedLocation) it.copy(items = items, loading = false) else it
+                    if (it.locationKey() == requestedLocation) {
+                        it.copy(items = items, loading = false, selectedIds = it.selectedIds.intersect(items.mapTo(hashSetOf()) { entry -> entry.id }))
+                    } else it
                 }
                 prefetchCloudDirectories(requestedLocation, items)
             }.onFailure { error ->
@@ -320,7 +409,32 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
             deviceStore.delete(requireNotNull(entry.devicePath))
         }
         mutableState.update { state ->
-            state.copy(clipboard = state.clipboard?.takeUnless { it.entry.id == entry.id })
+            state.copy(clipboard = state.clipboard?.takeUnless { clip -> clip.entries.any { it.id == entry.id } })
+        }
+    }
+
+    fun delete(entries: List<BrowserEntry>) = operation(
+        if (entries.size == 1) {
+            if (entries.first().source == BrowserSource.CloudDrive) "${entries.first().name} moved to Trash" else "${entries.first().name} deleted"
+        } else if (entries.all { it.source == BrowserSource.CloudDrive }) {
+            "${entries.size} items moved to Trash"
+        } else {
+            "${entries.size} items deleted"
+        },
+    ) {
+        require(entries.isNotEmpty() && entries.none { it.driveRoot }) { "Choose files or folders" }
+        entries.filter { it.source == BrowserSource.CloudDrive }
+            .groupBy { requireNotNull(it.driveProfileId) }
+            .forEach { (_, cloudEntries) ->
+                davClient(context, driveFor(cloudEntries.first())).moveManyToTrash(cloudEntries.map(BrowserEntry::cloudSegments))
+            }
+        entries.filter { it.source == BrowserSource.Device }.forEach { deviceStore.delete(requireNotNull(it.devicePath)) }
+        val removed = entries.mapTo(hashSetOf(), BrowserEntry::id)
+        mutableState.update { state ->
+            state.copy(
+                selectedIds = emptySet(),
+                clipboard = state.clipboard?.takeUnless { clip -> clip.entries.any { it.id in removed } },
+            )
         }
     }
 
@@ -328,9 +442,33 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
         mutableState.update { it.copy(clipboard = FileClipboard(action, entry), message = "${entry.name} ready to paste") }
     }
 
+    fun putClipboard(entries: List<BrowserEntry>, action: ClipboardAction) {
+        require(entries.isNotEmpty() && entries.none { it.driveRoot }) { "Choose files or folders" }
+        require(entries.map { it.source }.distinct().size == 1) { "Choose items from one source" }
+        require(entries.filter { it.source == BrowserSource.CloudDrive }.map { it.driveProfileId }.distinct().size <= 1) {
+            "Choose items from one CloudDrive"
+        }
+        mutableState.update {
+            it.copy(
+                clipboard = FileClipboard(action, entries),
+                selectedIds = emptySet(),
+                message = "${entries.size} items ready to ${if (action == ClipboardAction.Cut) "move" else "copy"}",
+            )
+        }
+    }
+
+    fun toggleSelection(entry: BrowserEntry) {
+        if (entry.driveRoot || mutableState.value.operationRunning) return
+        mutableState.update { state ->
+            state.copy(selectedIds = if (entry.id in state.selectedIds) state.selectedIds - entry.id else state.selectedIds + entry.id)
+        }
+    }
+
+    fun clearSelection() = mutableState.update { it.copy(selectedIds = emptySet()) }
+
     fun clearClipboard() = mutableState.update { it.copy(clipboard = null) }
 
-    fun paste() {
+    fun paste(conflictPolicy: FileConflictPolicy = FileConflictPolicy.Overwrite) {
         val current = mutableState.value
         if (current.operationRunning) return
         val clipboard = current.clipboard ?: return
@@ -347,7 +485,7 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
             mutableState.update {
                 it.copy(operationRunning = true, transferProgress = FileTransferProgress("$verb ${clipboard.entry.name}"), error = null)
             }
-            runCatching { withContext(Dispatchers.IO) { performPaste(clipboard, destination) } }
+            runCatching { withContext(Dispatchers.IO) { performPaste(clipboard, destination, conflictPolicy) } }
                 .onSuccess {
                     mutableState.update {
                         it.copy(
@@ -365,12 +503,14 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
-    fun setQuery(query: String) = mutableState.update { it.copy(query = query) }
+    fun setQuery(query: String) = mutableState.update { it.copy(query = query, selectedIds = emptySet()) }
     fun setSort(sort: FileSort) = mutableState.update { it.copy(sort = sort) }
     fun toggleLayout() = mutableState.update {
         it.copy(layout = if (it.layout == FileLayout.List) FileLayout.Grid else FileLayout.List)
     }
-    fun closeViewer() = mutableState.update { it.copy(viewer = null, imageViewer = null) }
+    fun closeViewer() = mutableState.update { it.copy(viewer = null, imageViewer = null, archiveViewer = null) }
+    fun closeArchive() = mutableState.update { it.copy(archiveViewer = null) }
+    fun consumeExternalOpen() = mutableState.update { it.copy(externalOpen = null) }
     fun consumeMessage() = mutableState.update { it.copy(message = null) }
 
     private fun operation(successMessage: String, block: suspend () -> Unit) {
@@ -424,7 +564,7 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
         return Triple(name, context.contentResolver.getType(uri) ?: "application/octet-stream", size)
     }
 
-    private fun createViewer(item: BrowserEntry): ViewerContent? {
+    private fun createViewer(item: BrowserEntry, cloudClient: DavClient? = null): ViewerContent? {
         val mimeType = item.mimeType.lowercase()
         val image = mimeType.startsWith("image/") || item.extension in IMAGE_EXTENSIONS
         val video = mimeType.startsWith("video/") || item.extension in VIDEO_EXTENSIONS
@@ -432,9 +572,9 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
         val proprietary = item.extension in PROPRIETARY_EXTENSIONS
         val uri = when {
             item.source == BrowserSource.Device && (image || video || audio) -> item.deviceUri
-            item.source == BrowserSource.CloudDrive && proprietary -> davClient(context, driveFor(item))
+            item.source == BrowserSource.CloudDrive && proprietary -> (cloudClient ?: davClient(context, driveFor(item)))
                 .previewUrl(item.cloudSegments, item.modified, item.size)
-            item.source == BrowserSource.CloudDrive && (image || video || audio) -> davClient(context, driveFor(item))
+            item.source == BrowserSource.CloudDrive && (image || video || audio) -> (cloudClient ?: davClient(context, driveFor(item)))
                 .downloadUrl(item.cloudSegments, item.modified, item.size)
             else -> null
         } ?: return null
@@ -451,6 +591,7 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
         private val VIDEO_EXTENSIONS = setOf("mp4", "mkv", "webm", "mov", "avi", "m4v", "3gp")
         private val AUDIO_EXTENSIONS = setOf("mp3", "m4a", "aac", "wav", "flac", "ogg", "oga", "opus", "amr")
         private val PROPRIETARY_EXTENSIONS = setOf("psd", "psb", "sai", "sai2")
+        private val ARCHIVE_EXTENSIONS = setOf("zip", "7z", "rar", "tar", "gz", "gzip", "tgz", "xz", "txz")
     }
 
     private fun activeDrive(): DriveProfile = mutableState.value.drives
@@ -482,7 +623,13 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
         val sourceDrive: DriveProfile?,
     )
 
-    private fun performPaste(clipboard: FileClipboard, destination: PasteDestination) {
+    private fun performPaste(clipboard: FileClipboard, destination: PasteDestination, conflictPolicy: FileConflictPolicy) {
+        clipboard.entries.forEach { entry ->
+            performPasteOne(FileClipboard(clipboard.action, entry), destination, conflictPolicy)
+        }
+    }
+
+    private fun performPasteOne(clipboard: FileClipboard, destination: PasteDestination, conflictPolicy: FileConflictPolicy) {
         when {
             clipboard.entry.source == BrowserSource.Device && destination.source == BrowserSource.CloudDrive -> {
                 val source = File(requireNotNull(clipboard.entry.devicePath))
@@ -490,8 +637,16 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
                 val total = snapshot.bytes
                 reportTransfer(0, total)
                 val client = davClient(context, requireNotNull(destination.cloudDrive) { "Choose a CloudDrive destination" })
-                if (source.isDirectory) uploadDeviceDirectoryStaged(client, source, destination.cloudPath, total)
-                else uploadDeviceEntry(client, source, destination.cloudPath, 0, total)
+                val existing = client.listCloud(destination.cloudPath, force = true).firstOrNull { it.name == source.name }
+                if (existing != null && (conflictPolicy == FileConflictPolicy.Skip ||
+                        conflictPolicy == FileConflictPolicy.KeepNewer && source.lastModified() / 1000 <= existing.modified)) {
+                    return
+                }
+                if (source.isDirectory) {
+                    if (!uploadDeviceDirectoryStaged(client, source, destination.cloudPath, total, conflictPolicy)) return
+                } else {
+                    uploadDeviceEntry(client, source, destination.cloudPath, 0, total, overwrite = existing != null)
+                }
                 if (clipboard.action == ClipboardAction.Cut) {
                     require(deviceStore.snapshot(source.absolutePath) == snapshot) { "Uploaded, but the source changed and was not removed" }
                     check(if (source.isDirectory) source.deleteRecursively() else source.delete()) { "Uploaded, but could not remove the local source" }
@@ -504,17 +659,25 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
                 reportTransfer(0, total)
                 val deviceDirectory = File(requireNotNull(destination.devicePath) { "Choose a device destination" })
                 val target = File(deviceDirectory, clipboard.entry.name)
-                require(!target.exists()) { "A file with this name already exists" }
+                if (target.exists() && (conflictPolicy == FileConflictPolicy.Skip ||
+                        conflictPolicy == FileConflictPolicy.KeepNewer && tree.entry.modified <= target.lastModified() / 1000)) {
+                    return
+                }
+                val stagingDirectory = File(deviceDirectory, ".clouddrive-stage-app-${java.util.UUID.randomUUID().toString().replace("-", "")}")
+                check(stagingDirectory.mkdir()) { "Cannot prepare download destination" }
                 try {
-                    downloadCloudEntry(client, tree, deviceDirectory, total)
+                    downloadCloudEntry(client, tree, stagingDirectory, total)
+                    deviceStore.publishStaged(File(stagingDirectory, clipboard.entry.name).absolutePath, target.absolutePath)
                 } catch (error: Exception) {
-                    if (target.isDirectory) target.deleteRecursively() else target.delete()
+                    stagingDirectory.deleteRecursively()
                     throw error
+                } finally {
+                    stagingDirectory.deleteRecursively()
                 }
                 if (clipboard.action == ClipboardAction.Cut) {
                     val currentTree = buildCloudTree(client, freshCloudEntry(client, clipboard.entry), force = true)
                     require(currentTree.fingerprint == tree.fingerprint) { "Downloaded, but the cloud source changed and was not removed" }
-                    client.delete(clipboard.entry.cloudSegments)
+                    client.moveToTrash(clipboard.entry.cloudSegments)
                 }
             }
             clipboard.entry.source == BrowserSource.CloudDrive && destination.source == BrowserSource.CloudDrive -> {
@@ -522,17 +685,29 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
                 require(clipboard.entry.driveProfileId == drive.id) { "Paste within the same CloudDrive" }
                 val total = clipboard.entry.size.takeIf { !clipboard.entry.isDirectory && it > 0 }
                 reportTransfer(0, total)
-                davClient(context, drive).paste(clipboard, destination.cloudPath)
+                davClient(context, drive).paste(clipboard, destination.cloudPath, conflictPolicy)
                 reportTransfer(total ?: 0, total)
             }
             clipboard.entry.source == BrowserSource.Device && destination.source == BrowserSource.Device -> {
-                deviceStore.paste(clipboard, requireNotNull(destination.devicePath) { "Choose a device destination" }, ::reportTransfer)
+                deviceStore.paste(
+                    clipboard,
+                    requireNotNull(destination.devicePath) { "Choose a device destination" },
+                    conflictPolicy,
+                    ::reportTransfer,
+                )
             }
             else -> error("Choose a valid destination")
         }
     }
 
-    private fun uploadDeviceEntry(client: DavClient, source: File, destination: List<String>, completedBefore: Long, total: Long): Long {
+    private fun uploadDeviceEntry(
+        client: DavClient,
+        source: File,
+        destination: List<String>,
+        completedBefore: Long,
+        total: Long,
+        overwrite: Boolean = false,
+    ): Long {
         require(source.exists() && source.canRead()) { "Cannot read ${source.name}" }
         if (source.isDirectory) {
             val target = destination + source.name
@@ -550,7 +725,7 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
             source.inputStream().use { input ->
                 client.upload(destination, source.name, android.webkit.MimeTypeMap.getSingleton()
                     .getMimeTypeFromExtension(source.extension.lowercase()) ?: "application/octet-stream", source.length(), input,
-                    overwrite = false,
+                    overwrite = overwrite,
                     onProgress = { reportTransfer(completedBefore + it, total) },
                 )
             }
@@ -558,7 +733,13 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
-    private fun uploadDeviceDirectoryStaged(client: DavClient, source: File, destination: List<String>, total: Long) {
+    private fun uploadDeviceDirectoryStaged(
+        client: DavClient,
+        source: File,
+        destination: List<String>,
+        total: Long,
+        conflictPolicy: FileConflictPolicy,
+    ): Boolean {
         val stagingName = ".clouddrive-stage-app-${java.util.UUID.randomUUID().toString().replace("-", "")}"
         val stagingPath = destination + stagingName
         client.createStagingDirectory(destination, stagingName)
@@ -566,7 +747,9 @@ class FileBrowserViewModel(application: Application) : AndroidViewModel(applicat
             val children = source.listFiles() ?: error("Cannot read folder ${source.name}")
             var completed = 0L
             children.forEach { completed = uploadDeviceEntry(client, it, stagingPath, completed, total) }
-            client.move(stagingPath, destination, source.name)
+            val moved = client.move(stagingPath, destination, source.name, conflictPolicy)
+            if (!moved) client.deleteStaging(stagingPath)
+            return moved
         } catch (error: Exception) {
             runCatching { client.deleteStaging(stagingPath) }
             throw error

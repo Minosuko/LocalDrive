@@ -13,6 +13,7 @@ import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.provider.Telephony
+import android.telephony.SubscriptionManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.Person
@@ -24,10 +25,12 @@ object MessageNotifier {
     private const val GROUP = "clouddrive_messages"
     private const val REPLY_KEY = "message_reply"
 
-    fun postSms(context: Context, address: String, body: String, threadId: Long) {
+    fun postSms(context: Context, address: String, body: String, threadId: Long, subscriptionId: Int?) {
         ensureChannel(context)
         if (!canNotify(context)) return
-        val person = Person.Builder().setName(address.ifBlank { "Unknown sender" }).build()
+        val sim = notificationSimLabel(subscriptionId)
+        val sender = address.ifBlank { "Unknown sender" }
+        val person = Person.Builder().setName(if (sim.isEmpty()) sender else "$sender | $sim").build()
         val open = PendingIntent.getActivity(
             context,
             notificationId(threadId),
@@ -49,6 +52,7 @@ object MessageNotifier {
             action = ACTION_REPLY
             putExtra(EXTRA_THREAD_ID, threadId)
             putExtra(EXTRA_ADDRESS, address)
+            subscriptionId?.let { putExtra(EXTRA_SUBSCRIPTION_ID, it) }
         }
         val reply = PendingIntent.getBroadcast(
             context,
@@ -71,6 +75,7 @@ object MessageNotifier {
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
             .addAction(NotificationCompat.Action.Builder(0, "Mark read", markRead).build())
             .addAction(NotificationCompat.Action.Builder(0, "Reply", reply).addRemoteInput(remoteInput).setAllowGeneratedReplies(true).build())
+            .apply { if (sim.isNotEmpty()) setSubText(sim) }
             .build()
         try {
             NotificationManagerCompat.from(context).notify(notificationId(threadId), notification)
@@ -141,7 +146,11 @@ class MessageActionReceiver : BroadcastReceiver() {
             ACTION_REPLY -> {
                 val address = intent.getStringExtra(EXTRA_ADDRESS).orEmpty()
                 val reply = MessageNotifier.replyText(intent)
-                if (address.isNotBlank() && reply.isNotBlank()) runCatching { SmsTransport.send(context, address, reply) }
+                val subscriptionId = intent.getIntExtra(EXTRA_SUBSCRIPTION_ID, SubscriptionManager.INVALID_SUBSCRIPTION_ID)
+                    .takeIf { it >= 0 }
+                if (address.isNotBlank() && reply.isNotBlank()) {
+                    runCatching { SmsTransport.send(context, address, reply, subscriptionId) }
+                }
                 if (threadId >= 0) markThreadRead(context, threadId)
             }
         }
@@ -165,5 +174,12 @@ internal fun markThreadRead(context: Context, threadId: Long) {
 internal const val EXTRA_OPEN_MESSAGES = "open_messages"
 internal const val EXTRA_THREAD_ID = "thread_id"
 private const val EXTRA_ADDRESS = "address"
+private const val EXTRA_SUBSCRIPTION_ID = "subscription_id"
 private const val ACTION_MARK_READ = "com.minosuko.clouddrive.MESSAGE_MARK_READ"
 private const val ACTION_REPLY = "com.minosuko.clouddrive.MESSAGE_REPLY"
+
+private fun notificationSimLabel(subscriptionId: Int?): String {
+    if (subscriptionId == null || subscriptionId < 0) return ""
+    val slot = runCatching { SubscriptionManager.getSlotIndex(subscriptionId) }.getOrDefault(-1)
+    return if (slot >= 0) "SIM ${slot + 1}" else ""
+}

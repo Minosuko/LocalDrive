@@ -12,7 +12,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 data class DashboardState(
     val loading: Boolean = true,
@@ -43,21 +42,33 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                     cloudStorage = drives.map { drive -> previous[drive.id]?.copy(drive = drive, error = null) ?: CloudStorageState(drive) },
                 )
             }
-            val device = withContext(Dispatchers.IO) { deviceStorageStats(getApplication()) }
-            if (generation == refreshGeneration) mutableState.update { it.copy(deviceStorage = device) }
             coroutineScope {
-                drives.map { drive ->
+                val jobs = drives.map { drive ->
                     launch(Dispatchers.IO) {
+                        val cached = previous[drive.id]?.storage ?: AppSettings.cachedServerStorage(getApplication(), drive)
+                        if (cached != null && generation == refreshGeneration) mutableState.update { current ->
+                            current.copy(cloudStorage = current.cloudStorage.map {
+                                if (it.drive.id == drive.id) it.copy(storage = cached) else it
+                            })
+                        }
                         val result = runCatching { davClient(getApplication(), drive).storageStats(force) }
                             .fold(
-                                onSuccess = { CloudStorageState(drive, storage = it) },
-                                onFailure = { CloudStorageState(drive, error = it.message ?: "Server unavailable") },
+                                onSuccess = {
+                                    AppSettings.saveServerStorage(getApplication(), drive, it)
+                                    CloudStorageState(drive, storage = it)
+                                },
+                                onFailure = { CloudStorageState(drive, storage = cached, error = it.message ?: "Server unavailable") },
                             )
                         if (generation == refreshGeneration) mutableState.update { current ->
                             current.copy(cloudStorage = current.cloudStorage.map { if (it.drive.id == drive.id) result else it })
                         }
                     }
-                }.joinAll()
+                }.toMutableList()
+                jobs += launch(Dispatchers.IO) {
+                    val device = deviceStorageStats(getApplication())
+                    if (generation == refreshGeneration) mutableState.update { it.copy(deviceStorage = device) }
+                }
+                jobs.joinAll()
             }
             if (generation == refreshGeneration) mutableState.update { it.copy(loading = false) }
         }

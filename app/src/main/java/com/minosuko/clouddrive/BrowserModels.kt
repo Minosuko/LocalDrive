@@ -9,6 +9,11 @@ import java.security.MessageDigest
 
 enum class BrowserSource { Device, CloudDrive }
 enum class ClipboardAction { Cut, Copy }
+enum class FileConflictPolicy(val headerValue: String) {
+    KeepNewer("keep-newer"),
+    Overwrite("overwrite"),
+    Skip("skip"),
+}
 
 data class BrowserEntry(
     val source: BrowserSource,
@@ -31,7 +36,10 @@ data class BrowserEntry(
     val extension: String = name.substringAfterLast('.', "").lowercase()
 }
 
-data class FileClipboard(val action: ClipboardAction, val entry: BrowserEntry)
+data class FileClipboard(val action: ClipboardAction, val entries: List<BrowserEntry>) {
+    constructor(action: ClipboardAction, entry: BrowserEntry) : this(action, listOf(entry))
+    val entry: BrowserEntry get() = entries.first()
+}
 data class TrashEntry(
     val id: String,
     val name: String,
@@ -80,7 +88,12 @@ class DeviceFileStore(private val context: Context) {
         check(if (target.isDirectory) target.deleteRecursively() else target.delete()) { "Cannot delete ${target.name}" }
     }
 
-    fun paste(clipboard: FileClipboard, destinationPath: String, onProgress: (Long, Long) -> Unit = { _, _ -> }) {
+    fun paste(
+        clipboard: FileClipboard,
+        destinationPath: String,
+        conflictPolicy: FileConflictPolicy,
+        onProgress: (Long, Long) -> Unit = { _, _ -> },
+    ): Boolean {
         val source = File(requireNotNull(clipboard.entry.devicePath))
         val sourcePath = source.canonicalFile
         val destination = File(destinationPath).canonicalFile
@@ -90,27 +103,57 @@ class DeviceFileStore(private val context: Context) {
             }
         }
         val target = File(destination, source.name)
-        require(!target.exists()) { "A file with this name already exists" }
+        require(target.canonicalFile != sourcePath) { "Source and destination are the same" }
+        if (target.exists()) {
+            if (conflictPolicy == FileConflictPolicy.Skip ||
+                (conflictPolicy == FileConflictPolicy.KeepNewer && source.lastModified() <= target.lastModified())) {
+                return false
+            }
+        }
         val snapshot = snapshot(source.absolutePath)
         val total = snapshot.bytes
-        if (clipboard.action == ClipboardAction.Cut && source.renameTo(target)) {
+        if (!target.exists() && clipboard.action == ClipboardAction.Cut && source.renameTo(target)) {
             onProgress(total, total)
-            return
+            return true
         }
+        val stage = File(destination, ".clouddrive-stage-app-${java.util.UUID.randomUUID().toString().replace("-", "")}")
         var copied = 0L
         try {
-            copyEntry(source, target) { count ->
+            copyEntry(source, stage) { count ->
                 copied += count
                 onProgress(copied, total)
             }
+            replaceTarget(stage, target)
         } catch (error: Exception) {
-            if (target.isDirectory) target.deleteRecursively() else target.delete()
+            if (stage.isDirectory) stage.deleteRecursively() else stage.delete()
             throw error
         }
         if (clipboard.action == ClipboardAction.Cut) {
             require(snapshot(source.absolutePath) == snapshot) { "Copied, but the source changed and was not removed" }
             check(if (source.isDirectory) source.deleteRecursively() else source.delete()) { "Copied, but could not remove the source" }
         }
+        return true
+    }
+
+    fun publishStaged(stagedPath: String, targetPath: String) {
+        val staged = File(stagedPath).canonicalFile
+        val target = File(targetPath).canonicalFile
+        require(staged.exists() && staged != target) { "Staged file is unavailable" }
+        replaceTarget(staged, target)
+    }
+
+    private fun replaceTarget(stage: File, target: File) {
+        if (!target.exists()) {
+            check(stage.renameTo(target)) { "Cannot finalize ${target.name}" }
+            return
+        }
+        val backup = File(target.parentFile, ".clouddrive-stage-backup-${java.util.UUID.randomUUID().toString().replace("-", "")}")
+        check(target.renameTo(backup)) { "Cannot prepare existing ${target.name}" }
+        if (!stage.renameTo(target)) {
+            backup.renameTo(target)
+            error("Cannot replace ${target.name}")
+        }
+        if (backup.isDirectory) backup.deleteRecursively() else backup.delete()
     }
 
     fun snapshot(path: String): DeviceSnapshot {

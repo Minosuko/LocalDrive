@@ -1,24 +1,33 @@
 package com.minosuko.clouddrive
 
 import android.app.Application
+import android.app.Activity
+import android.content.ClipData
+import android.content.ContentValues
 import android.content.ContentUris
 import android.content.Intent
 import android.database.ContentObserver
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.os.Build
 import android.provider.MediaStore
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculatePan
@@ -32,6 +41,7 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -58,8 +68,11 @@ import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material.icons.outlined.Menu
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Share
+import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.DriveFileMove
 import androidx.compose.material.icons.outlined.VideoFile
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -69,17 +82,24 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
@@ -106,23 +126,31 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import coil.compose.AsyncImage
 import coil.compose.SubcomposeAsyncImage
 import coil.compose.SubcomposeAsyncImageContent
 import coil.request.ImageRequest
 import coil.request.videoFrameMillis
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import okhttp3.Headers
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import kotlin.math.abs
+import java.util.UUID
 
 data class GalleryPhoto(
     val key: String,
@@ -136,8 +164,11 @@ data class GalleryPhoto(
     val width: Int,
     val height: Int,
     val durationMillis: Long = 0,
+    val size: Long = 0,
     val requestHeaders: Map<String, String> = emptyMap(),
     val source: BrowserSource,
+    val driveProfileId: String? = null,
+    val cloudSegments: List<String> = emptyList(),
 ) {
     val isVideo: Boolean = mimeType.startsWith("video/", ignoreCase = true) ||
         name.substringAfterLast('.', "").lowercase() in GALLERY_VIDEO_EXTENSIONS
@@ -150,11 +181,20 @@ data class PhotosState(
     val cloudLoading: Boolean = true,
     val deviceError: String? = null,
     val cloudError: String? = null,
+    val operationRunning: Boolean = false,
+    val operationMessage: String? = null,
+    val shareRequest: PhotoShareRequest? = null,
 ) {
     fun photos(source: BrowserSource): List<GalleryPhoto> = if (source == BrowserSource.Device) devicePhotos else cloudPhotos
     fun loading(source: BrowserSource): Boolean = if (source == BrowserSource.Device) deviceLoading else cloudLoading
     fun error(source: BrowserSource): String? = if (source == BrowserSource.Device) deviceError else cloudError
 }
+
+data class PhotoShareRequest(
+    val id: String = UUID.randomUUID().toString(),
+    val uris: List<Uri>,
+    val mimeType: String,
+)
 
 private data class PhotoFolder(
     val key: String,
@@ -169,7 +209,13 @@ private data class PhotoViewerRequest(
     val title: String,
 )
 
-private data class CloudPhotoResult(val photos: List<GalleryPhoto>, val error: String?)
+private data class PendingDeviceAlbumMove(val photos: List<GalleryPhoto>, val relativePath: String)
+
+private sealed interface CloudPhotoEvent {
+    data class Batch(val photos: List<GalleryPhoto>) : CloudPhotoEvent
+    data class Error(val message: String) : CloudPhotoEvent
+    data object Complete : CloudPhotoEvent
+}
 
 class PhotosViewModel(application: Application) : AndroidViewModel(application) {
     private val context = application.applicationContext
@@ -181,7 +227,12 @@ class PhotosViewModel(application: Application) : AndroidViewModel(application) 
     private var cloudLoading = true
     private var deviceError: String? = null
     private var cloudError: String? = null
+    private var operationRunning = false
+    private var operationMessage: String? = null
+    private var shareRequest: PhotoShareRequest? = null
     private var deviceRefresh: Job? = null
+    private var deviceRetry: Job? = null
+    private var deviceRetryAttempt = 0
     private var cloudRefresh: Job? = null
     private var cloudLoaded = false
     private var lastCloudRefresh = 0L
@@ -198,19 +249,29 @@ class PhotosViewModel(application: Application) : AndroidViewModel(application) 
     init {
         context.contentResolver.registerContentObserver(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, true, observer)
         context.contentResolver.registerContentObserver(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, true, observer)
-        refresh()
+        refreshDevicePhotos()
     }
 
     fun refresh(forceCloud: Boolean = false) {
         refreshDevicePhotos()
-        val driveSignature = currentDriveSignature()
+        if (forceCloud || cloudLoaded) ensureCloudLoaded(forceCloud)
+    }
+
+    fun ensureCloudLoaded(force: Boolean = false) {
         val stale = android.os.SystemClock.elapsedRealtime() - lastCloudRefresh >= CLOUD_MEDIA_REFRESH_MILLIS
-        if (forceCloud || !cloudLoaded || stale || driveSignature != loadedDriveSignature) {
-            refreshCloudPhotos(forceCloud, driveSignature)
-        }
+        if (!force && cloudLoaded && !stale) return
+        refreshCloudPhotos(force)
     }
 
     private fun refreshDevicePhotos() {
+        deviceRetry?.cancel()
+        deviceRetry = null
+        deviceRetryAttempt = 0
+        refreshDevicePhotos(resetRetry = true)
+    }
+
+    private fun refreshDevicePhotos(resetRetry: Boolean) {
+        if (resetRetry) deviceRetryAttempt = 0
         deviceRefresh?.cancel()
         if (!hasPhotoPermission(context) && !hasVideoPermission(context)) {
             devicePhotos = emptyList()
@@ -223,28 +284,64 @@ class PhotosViewModel(application: Application) : AndroidViewModel(application) 
         deviceError = null
         publish()
         deviceRefresh = viewModelScope.launch {
-            runCatching { withContext(Dispatchers.IO) { queryDevicePhotos() } }
-                .onSuccess { photos -> devicePhotos = photos }
-                .onFailure { error -> deviceError = error.message ?: "Could not open media library" }
+            try {
+                devicePhotos = withContext(Dispatchers.IO) { queryDevicePhotos() }
+                deviceError = null
+                deviceRetryAttempt = 0
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                deviceError = error.message ?: "Could not open media library"
+                scheduleDeviceRetry()
+            }
             deviceLoading = false
             publish()
         }
     }
 
-    private fun refreshCloudPhotos(force: Boolean, driveSignature: String) {
+    private fun scheduleDeviceRetry() {
+        if (deviceRetryAttempt >= DEVICE_MEDIA_RETRY_DELAYS.size) return
+        val retryDelay = DEVICE_MEDIA_RETRY_DELAYS[deviceRetryAttempt++]
+        deviceRetry?.cancel()
+        deviceRetry = viewModelScope.launch {
+            delay(retryDelay)
+            refreshDevicePhotos(resetRetry = false)
+        }
+    }
+
+    private fun refreshCloudPhotos(force: Boolean) {
         if (cloudRefresh?.isActive == true) return
         cloudLoading = true
         cloudError = null
         publish()
         cloudRefresh = viewModelScope.launch {
-            val result = withContext(Dispatchers.IO) { queryCloudPhotos(force) }
-            cloudPhotos = result.photos
-            cloudError = result.error
-            cloudLoading = false
-            cloudLoaded = true
-            lastCloudRefresh = android.os.SystemClock.elapsedRealtime()
-            loadedDriveSignature = driveSignature
-            publish()
+            try {
+                val driveSignature = withContext(Dispatchers.IO) { currentDriveSignature() }
+                val stale = android.os.SystemClock.elapsedRealtime() - lastCloudRefresh >= CLOUD_MEDIA_REFRESH_MILLIS
+                if (!force && cloudLoaded && !stale && driveSignature == loadedDriveSignature) return@launch
+
+                val previousPhotos = cloudPhotos
+                var refreshedPhotos = emptyList<GalleryPhoto>()
+                val error = queryCloudPhotos(force) { batch ->
+                    refreshedPhotos = mergeNewestPhotos(refreshedPhotos, batch)
+                    if (previousPhotos.isEmpty()) {
+                        cloudPhotos = refreshedPhotos
+                        publish()
+                    }
+                }
+                cloudPhotos = if (error != null && refreshedPhotos.isEmpty()) previousPhotos else refreshedPhotos
+                cloudError = error
+                cloudLoaded = true
+                lastCloudRefresh = android.os.SystemClock.elapsedRealtime()
+                loadedDriveSignature = driveSignature
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                cloudError = error.message ?: "Could not load CloudDrive media"
+            } finally {
+                cloudLoading = false
+                publish()
+            }
         }
     }
 
@@ -260,6 +357,9 @@ class PhotosViewModel(application: Application) : AndroidViewModel(application) 
             cloudLoading = cloudLoading,
             deviceError = deviceError,
             cloudError = cloudError,
+            operationRunning = operationRunning,
+            operationMessage = operationMessage,
+            shareRequest = shareRequest,
         )
     }
 
@@ -267,7 +367,7 @@ class PhotosViewModel(application: Application) : AndroidViewModel(application) 
         val output = mutableListOf<GalleryPhoto>()
         if (hasPhotoPermission(context)) queryDeviceCollection(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, false, output)
         if (hasVideoPermission(context)) queryDeviceCollection(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, true, output)
-        return output.sortedWith(compareByDescending<GalleryPhoto> { it.takenAt }.thenBy { it.key })
+        return output.sortedWith(photoNewestComparator)
     }
 
     private fun queryDeviceCollection(collection: Uri, video: Boolean, output: MutableList<GalleryPhoto>) {
@@ -281,6 +381,7 @@ class PhotosViewModel(application: Application) : AndroidViewModel(application) 
             add(MediaStore.MediaColumns.RELATIVE_PATH)
             add(MediaStore.MediaColumns.WIDTH)
             add(MediaStore.MediaColumns.HEIGHT)
+            add(MediaStore.MediaColumns.SIZE)
             if (video) add(MediaStore.Video.VideoColumns.DURATION)
         }.toTypedArray()
         context.contentResolver.query(
@@ -299,6 +400,7 @@ class PhotosViewModel(application: Application) : AndroidViewModel(application) 
             val path = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.RELATIVE_PATH)
             val width = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.WIDTH)
             val height = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.HEIGHT)
+            val size = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE)
             val duration = if (video) cursor.getColumnIndexOrThrow(MediaStore.Video.VideoColumns.DURATION) else -1
             while (cursor.moveToNext()) {
                 val mediaId = cursor.getLong(id)
@@ -316,29 +418,40 @@ class PhotosViewModel(application: Application) : AndroidViewModel(application) 
                     width = cursor.getInt(width),
                     height = cursor.getInt(height),
                     durationMillis = if (duration >= 0) cursor.getLong(duration) else 0,
+                    size = cursor.getLong(size).coerceAtLeast(0),
                     source = BrowserSource.Device,
                 )
             }
         }
     }
 
-    private fun queryCloudPhotos(force: Boolean): CloudPhotoResult {
-        val photos = mutableListOf<GalleryPhoto>()
+    private suspend fun queryCloudPhotos(force: Boolean, onBatch: (List<GalleryPhoto>) -> Unit): String? = coroutineScope {
         val errors = mutableListOf<String>()
         val ownBackup = syncDeviceFolder(context)
-        AppSettings.drives(context)
+        val drives = AppSettings.drives(context)
             .filter { drive -> AccountStore.hasSession(context, drive.id) }
-            .forEach { drive ->
-                runCatching {
+        if (drives.isEmpty()) return@coroutineScope null
+        val events = Channel<CloudPhotoEvent>(Channel.UNLIMITED)
+        drives.forEach { drive ->
+            launch(Dispatchers.IO) {
+                try {
                     val client = davClient(context, drive)
                     val headers = client.requestHeaders()
-                    client.forEachCloudTree(emptyList(), force = force) { entry ->
+                    val batch = ArrayList<GalleryPhoto>(CLOUD_MEDIA_BATCH_SIZE)
+                    val scanContext = coroutineContext
+                    client.forEachCloudTree(
+                        segments = emptyList(),
+                        force = force,
+                        mediaOnly = true,
+                        excludedPrefix = listOf("Sync", ownBackup),
+                    ) { entry ->
+                        scanContext.ensureActive()
                         if (entry.isDirectory || isCurrentDeviceBackup(entry.cloudSegments, ownBackup) || !entry.isGalleryMedia()) {
                             return@forEachCloudTree
                         }
                         val parent = entry.cloudSegments.dropLast(1)
                         val displayPath = (listOf("CloudDrive", drive.name) + parent).joinToString("/")
-                        photos += GalleryPhoto(
+                        batch += GalleryPhoto(
                             key = "cloud:${drive.id}:${entry.cloudSegments.joinToString("/")}",
                             uri = client.downloadUrl(entry.cloudSegments, entry.modified, entry.size),
                             thumbnailUri = if (entry.isGalleryVideo()) null else client.thumbnailUrl(
@@ -353,19 +466,191 @@ class PhotosViewModel(application: Application) : AndroidViewModel(application) 
                             relativePath = displayPath,
                             width = 0,
                             height = 0,
+                            size = entry.size,
                             requestHeaders = headers,
                             source = BrowserSource.CloudDrive,
+                            driveProfileId = drive.id,
+                            cloudSegments = entry.cloudSegments,
                         )
+                        if (batch.size == CLOUD_MEDIA_BATCH_SIZE) {
+                            events.trySend(CloudPhotoEvent.Batch(batch.toList()))
+                            batch.clear()
+                        }
                     }
-                }.onFailure { error -> errors += "${drive.name}: ${error.message ?: "could not load media"}" }
+                    if (batch.isNotEmpty()) events.trySend(CloudPhotoEvent.Batch(batch.toList()))
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    events.trySend(CloudPhotoEvent.Error("${drive.name}: ${error.message ?: "could not load media"}"))
+                } finally {
+                    events.trySend(CloudPhotoEvent.Complete)
+                }
             }
-        return CloudPhotoResult(photos, errors.takeIf { it.isNotEmpty() }?.joinToString(". "))
+        }
+        var remaining = drives.size
+        var deliveredFirstBatch = false
+        val pendingPhotos = ArrayList<GalleryPhoto>(CLOUD_MEDIA_UI_BATCH_SIZE)
+        while (remaining > 0) {
+            when (val event = events.receive()) {
+                is CloudPhotoEvent.Batch -> {
+                    pendingPhotos += event.photos
+                    if (!deliveredFirstBatch || pendingPhotos.size >= CLOUD_MEDIA_UI_BATCH_SIZE) {
+                        onBatch(pendingPhotos.toList())
+                        pendingPhotos.clear()
+                        deliveredFirstBatch = true
+                        yield()
+                    }
+                }
+                is CloudPhotoEvent.Error -> errors += event.message
+                CloudPhotoEvent.Complete -> remaining--
+            }
+        }
+        if (pendingPhotos.isNotEmpty()) onBatch(pendingPhotos)
+        events.close()
+        errors.takeIf { it.isNotEmpty() }?.joinToString(". ")
+    }
+
+    fun prepareShare(photos: List<GalleryPhoto>) {
+        if (photos.isEmpty() || operationRunning) return
+        viewModelScope.launch {
+            operationRunning = true
+            operationMessage = null
+            shareRequest = null
+            publish()
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    photos.map { photo ->
+                        if (photo.source == BrowserSource.Device) return@map photo.uri
+                        val drive = AppSettings.drives(context).firstOrNull { it.id == photo.driveProfileId }
+                            ?: error("CloudDrive is no longer connected")
+                        val entry = BrowserEntry(
+                            source = BrowserSource.CloudDrive,
+                            name = photo.name,
+                            isDirectory = false,
+                            size = photo.size,
+                            mimeType = photo.mimeType,
+                            modified = photo.takenAt / 1_000,
+                            cloudSegments = photo.cloudSegments,
+                            driveProfileId = drive.id,
+                        )
+                        stageCloudExternalFile(context, davClient(context, drive), entry, installPackage = false) {}.uri
+                    }
+                }
+            }.onSuccess { uris ->
+                operationRunning = false
+                shareRequest = PhotoShareRequest(uris = uris, mimeType = commonPhotoMimeType(photos))
+                publish()
+            }.onFailure { error ->
+                operationRunning = false
+                operationMessage = error.message ?: "Could not prepare media for sharing"
+                publish()
+            }
+        }
+    }
+
+    fun deleteCloudPhotos(photos: List<GalleryPhoto>) = photoOperation(
+        successMessage = if (photos.size == 1) "Media moved to Trash" else "${photos.size} items moved to Trash",
+        refreshCloud = true,
+    ) {
+        photos.groupBy { requireNotNull(it.driveProfileId) }.forEach { (driveId, grouped) ->
+            val drive = AppSettings.drives(context).firstOrNull { it.id == driveId }
+                ?: error("CloudDrive is no longer connected")
+            davClient(context, drive).moveManyToTrash(grouped.map(GalleryPhoto::cloudSegments))
+        }
+    }
+
+    fun deleteDevicePhotos(photos: List<GalleryPhoto>) = photoOperation(
+        successMessage = if (photos.size == 1) "Media deleted" else "${photos.size} items deleted",
+        refreshDevice = true,
+    ) {
+        photos.forEach { photo ->
+            check(context.contentResolver.delete(photo.uri, null, null) > 0) { "Could not delete ${photo.name}" }
+        }
+    }
+
+    fun moveDevicePhotos(photos: List<GalleryPhoto>, relativePath: String) = photoOperation(
+        successMessage = if (photos.size == 1) "Moved to Album" else "${photos.size} items moved to Album",
+        refreshDevice = true,
+    ) {
+        val normalized = relativePath.replace('\\', '/').trim('/')
+        require(normalized.isNotBlank() && normalized.split('/').none { it.isBlank() || it == "." || it == ".." }) {
+            "Invalid Album path"
+        }
+        val values = ContentValues().apply { put(MediaStore.MediaColumns.RELATIVE_PATH, "$normalized/") }
+        photos.forEach { photo ->
+            check(context.contentResolver.update(photo.uri, values, null, null) > 0) { "Could not move ${photo.name}" }
+        }
+    }
+
+    fun moveCloudPhotos(photos: List<GalleryPhoto>, destination: List<String>) = photoOperation(
+        successMessage = if (photos.size == 1) "Moved to Album" else "${photos.size} items moved to Album",
+        refreshCloud = true,
+    ) {
+        require(destination.size <= 64 && destination.none {
+            it.isBlank() || it == "." || it == ".." || '/' in it || '\\' in it || it.startsWith(".clouddrive-stage-", true)
+        }) { "Invalid Album path" }
+        val driveId = photos.mapNotNull(GalleryPhoto::driveProfileId).distinct().singleOrNull()
+            ?: error("Choose media from one CloudDrive")
+        val drive = AppSettings.drives(context).firstOrNull { it.id == driveId }
+            ?: error("CloudDrive is no longer connected")
+        val client = davClient(context, drive)
+        client.ensureDirectories(destination)
+        photos.forEach { photo ->
+            if (photo.cloudSegments.dropLast(1) != destination) {
+                client.moveFile(photo.cloudSegments, destination, photo.name, FileConflictPolicy.KeepNewer)
+            }
+        }
+    }
+
+    fun consumeOperationMessage() {
+        operationMessage = null
+        publish()
+    }
+
+    fun consumeShareRequest() {
+        shareRequest = null
+        publish()
+    }
+
+    private fun photoOperation(
+        successMessage: String,
+        refreshDevice: Boolean = false,
+        refreshCloud: Boolean = false,
+        block: () -> Unit,
+    ) {
+        if (operationRunning) return
+        viewModelScope.launch {
+            operationRunning = true
+            operationMessage = null
+            publish()
+            runCatching { withContext(Dispatchers.IO) { block() } }
+                .onSuccess {
+                    operationRunning = false
+                    operationMessage = successMessage
+                    publish()
+                    if (refreshDevice) refreshDevicePhotos()
+                    if (refreshCloud) ensureCloudLoaded(force = true)
+                }
+                .onFailure { error ->
+                    operationRunning = false
+                    operationMessage = error.message ?: "Media operation failed"
+                    publish()
+                }
+        }
     }
 
     override fun onCleared() {
         observerHandler.removeCallbacks(deviceRefreshRunnable)
         context.contentResolver.unregisterContentObserver(observer)
     }
+}
+
+private fun commonPhotoMimeType(photos: List<GalleryPhoto>): String {
+    val types = photos.map { it.mimeType }.distinct()
+    if (types.size == 1) return types.first()
+    if (photos.all { !it.isVideo }) return "image/*"
+    if (photos.all(GalleryPhoto::isVideo)) return "video/*"
+    return "*/*"
 }
 
 @OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
@@ -385,10 +670,38 @@ fun PhotosScreen(onNavigationVisibilityChanged: (Boolean) -> Unit = {}) {
     var sourceMenuExpanded by remember { mutableStateOf(false) }
     var viewerRequest by remember { mutableStateOf<PhotoViewerRequest?>(null) }
     var videoViewer by remember { mutableStateOf<ViewerContent?>(null) }
+    var selectedKeys by rememberSaveable { mutableStateOf(emptyList<String>()) }
+    var deleteSelection by remember { mutableStateOf(false) }
+    var moveSelection by remember { mutableStateOf(false) }
+    var newAlbumName by remember { mutableStateOf("") }
+    var pendingDeviceMove by remember { mutableStateOf<PendingDeviceAlbumMove?>(null) }
+    val snackbar = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
+    val timelineListState = rememberLazyListState()
+    val timelineGridState = rememberLazyGridState()
+    val albumsListState = rememberLazyListState()
+    val albumsGridState = rememberLazyGridState()
+    val albumPhotosListState = rememberLazyListState()
+    val albumPhotosGridState = rememberLazyGridState()
     val currentNavigationCallback by rememberUpdatedState(onNavigationVisibilityChanged)
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         permissionVersion++
         model.refresh()
+    }
+    val trashLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            selectedKeys = emptyList()
+            model.refresh()
+            scope.launch { snackbar.showSnackbar("Media moved to Trash") }
+        }
+    }
+    val albumWriteLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
+        val pending = pendingDeviceMove
+        pendingDeviceMove = null
+        if (result.resultCode == Activity.RESULT_OK && pending != null) {
+            selectedKeys = emptyList()
+            model.moveDevicePhotos(pending.photos, pending.relativePath)
+        }
     }
     val hasImageAccess = remember(permissionVersion, state.deviceLoading, state.devicePhotos.size) { hasPhotoPermission(context) }
     val hasVideoAccess = remember(permissionVersion, state.deviceLoading, state.devicePhotos.size) { hasVideoPermission(context) }
@@ -409,9 +722,10 @@ fun PhotosScreen(onNavigationVisibilityChanged: (Boolean) -> Unit = {}) {
     val photos = state.photos(source)
     val loading = state.loading(source)
     val error = state.error(source)
-    val folders = remember(photos, showFolders, selectedFolderKey) {
-        if (showFolders || selectedFolderKey != null) buildPhotoFolders(photos) else emptyList()
-    }
+    val allAlbums = remember(photos) { buildPhotoFolders(photos) }
+    val folders = if (showFolders || selectedFolderKey != null) allAlbums else emptyList()
+    val selectedKeySet = selectedKeys.toSet()
+    val selectedPhotos = remember(photos, selectedKeys) { photos.filter { it.key in selectedKeySet } }
     val selectedFolder = remember(folders, selectedFolderKey) {
         folders.firstOrNull { it.key == selectedFolderKey }
     }
@@ -424,21 +738,71 @@ fun PhotosScreen(onNavigationVisibilityChanged: (Boolean) -> Unit = {}) {
     LaunchedEffect(folders, selectedFolderKey) {
         if (selectedFolderKey != null && folders.none { it.key == selectedFolderKey }) selectedFolderKey = null
     }
+    LaunchedEffect(photos) {
+        val available = photos.mapTo(hashSetOf(), GalleryPhoto::key)
+        selectedKeys = selectedKeys.filter { it in available }
+    }
+    LaunchedEffect(selectedPhotos.isEmpty()) {
+        if (selectedPhotos.isEmpty()) {
+            deleteSelection = false
+            moveSelection = false
+        }
+    }
+    LaunchedEffect(selectedFolderKey) {
+        if (selectedFolderKey != null) {
+            albumPhotosListState.scrollToItem(0)
+            albumPhotosGridState.scrollToItem(0)
+        }
+    }
+    LaunchedEffect(state.operationMessage) {
+        state.operationMessage?.let {
+            snackbar.showSnackbar(it)
+            model.consumeOperationMessage()
+        }
+    }
+    LaunchedEffect(state.shareRequest?.id) {
+        val request = state.shareRequest ?: return@LaunchedEffect
+        try {
+            val share = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                type = request.mimeType
+                putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(request.uris))
+                clipData = ClipData.newRawUri("Shared media", request.uris.first()).apply {
+                    request.uris.drop(1).forEach { addItem(ClipData.Item(it)) }
+                }
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            ContextCompat.startActivity(context, Intent.createChooser(share, "Share media"), null)
+            selectedKeys = emptyList()
+        } catch (error: Exception) {
+            snackbar.showSnackbar(error.message ?: "No app can share this media")
+        } finally {
+            model.consumeShareRequest()
+        }
+    }
     LaunchedEffect(source) {
         selectedFolderKey = null
         viewerRequest = null
         videoViewer = null
+        selectedKeys = emptyList()
+        chromeVisible = true
+        if (source == BrowserSource.CloudDrive) model.ensureCloudLoaded()
+    }
+    LaunchedEffect(showFolders, selectedFolderKey, layout) {
+        selectedKeys = emptyList()
         chromeVisible = true
     }
-    LaunchedEffect(showFolders, selectedFolderKey, layout) { chromeVisible = true }
-    BackHandler(enabled = selectedFolder != null && viewerRequest == null) {
-        selectedFolderKey = null
+    BackHandler(enabled = (selectedPhotos.isNotEmpty() || selectedFolder != null) && viewerRequest == null && videoViewer == null) {
+        if (selectedPhotos.isNotEmpty()) selectedKeys = emptyList() else selectedFolderKey = null
         chromeVisible = true
     }
 
     val updateLayout: (PhotoLayoutMode) -> Unit = { selected ->
         layout = selected
         AppSettings.savePhotoLayout(context, selected)
+        chromeVisible = true
+    }
+    val togglePhotoSelection: (GalleryPhoto) -> Unit = { photo ->
+        selectedKeys = if (photo.key in selectedKeySet) selectedKeys - photo.key else selectedKeys + photo.key
         chromeVisible = true
     }
     val openMedia: (GalleryPhoto, List<GalleryPhoto>, String) -> Unit = { media, mediaList, title ->
@@ -455,14 +819,47 @@ fun PhotosScreen(onNavigationVisibilityChanged: (Boolean) -> Unit = {}) {
             viewerRequest = PhotoViewerRequest(images, media.key, title)
         }
     }
+    val moveDeviceSelection: (String) -> Unit = { relativePath ->
+        if (Build.VERSION.SDK_INT >= 30) {
+            runCatching {
+                val request = MediaStore.createWriteRequest(context.contentResolver, selectedPhotos.map(GalleryPhoto::uri))
+                pendingDeviceMove = PendingDeviceAlbumMove(selectedPhotos, relativePath)
+                albumWriteLauncher.launch(IntentSenderRequest.Builder(request.intentSender).build())
+            }.onFailure { error -> scope.launch { snackbar.showSnackbar(error.message ?: "Could not request media access") } }
+        } else {
+            selectedKeys = emptyList()
+            model.moveDevicePhotos(selectedPhotos, relativePath)
+        }
+    }
+    val albumCandidates = remember(allAlbums, selectedPhotos) {
+        val driveId = selectedPhotos.firstOrNull()?.driveProfileId
+        allAlbums.filter { album ->
+            album.photos.firstOrNull()?.let { photo ->
+                photo.source == source && (source == BrowserSource.Device || photo.driveProfileId == driveId)
+            } == true
+        }
+    }
 
-    Column(Modifier.fillMaxSize()) {
+    Box(Modifier.fillMaxSize()) {
+      Column(Modifier.fillMaxSize()) {
         AnimatedVisibility(
             visible = chromeVisible,
-            enter = slideInVertically { -it } + fadeIn(),
-            exit = slideOutVertically { -it } + fadeOut(),
+            enter = expandVertically(animationSpec = tween(220), expandFrom = Alignment.Top) +
+                slideInVertically(animationSpec = tween(220)) { -it } + fadeIn(tween(160)),
+            exit = shrinkVertically(animationSpec = tween(200), shrinkTowards = Alignment.Top) +
+                slideOutVertically(animationSpec = tween(200)) { -it } + fadeOut(tween(140)),
         ) {
-            if (selectedFolder != null) {
+            if (selectedPhotos.isNotEmpty()) {
+                PhotoSelectionHeader(
+                    count = selectedPhotos.size,
+                    moveEnabled = source == BrowserSource.Device || selectedPhotos.mapNotNull(GalleryPhoto::driveProfileId).distinct().size == 1,
+                    busy = state.operationRunning,
+                    onClose = { selectedKeys = emptyList() },
+                    onShare = { model.prepareShare(selectedPhotos) },
+                    onMove = { moveSelection = true },
+                    onDelete = { deleteSelection = true },
+                )
+            } else if (selectedFolder != null) {
                 PhotoFolderHeader(
                     folder = selectedFolder,
                     pageOrder = pageOrder,
@@ -492,7 +889,9 @@ fun PhotosScreen(onNavigationVisibilityChanged: (Boolean) -> Unit = {}) {
                             }
                         }
                         PhotoLayoutMenu(layout, updateLayout)
-                        IconButton(onClick = { model.refresh(forceCloud = true) }) { Icon(Icons.Outlined.Refresh, "Refresh media") }
+                        IconButton(onClick = {
+                            if (source == BrowserSource.CloudDrive) model.ensureCloudLoaded(force = true) else model.refresh()
+                        }) { Icon(Icons.Outlined.Refresh, "Refresh media") }
                         Box {
                             IconButton(onClick = { sourceMenuExpanded = true }) {
                                 Icon(Icons.Outlined.Menu, "Media source: ${if (source == BrowserSource.Device) "Device" else "CloudDrive"}")
@@ -521,13 +920,15 @@ fun PhotosScreen(onNavigationVisibilityChanged: (Boolean) -> Unit = {}) {
                         Tab(
                             selected = showFolders,
                             onClick = { showFolders = true },
-                            text = { Text("Folders") },
+                            text = { Text("Albums") },
                             icon = { Icon(Icons.Outlined.Folder, null, Modifier.size(19.dp)) },
                         )
                     }
                 }
             }
         }
+
+        if (state.operationRunning) LinearProgressIndicator(Modifier.fillMaxWidth())
 
         when {
             loading && photos.isEmpty() -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
@@ -537,24 +938,33 @@ fun PhotosScreen(onNavigationVisibilityChanged: (Boolean) -> Unit = {}) {
                 action = "Allow media",
                 onAction = { permissionLauncher.launch(visualMediaPermissions()) },
             )
-            error != null -> GalleryEmptyState("Media library unavailable", error, "Try again") { model.refresh(forceCloud = true) }
+            error != null && photos.isEmpty() -> GalleryEmptyState("Media library unavailable", error, "Try again") {
+                if (source == BrowserSource.CloudDrive) model.ensureCloudLoaded(force = true) else model.refresh()
+            }
             photos.isEmpty() && source == BrowserSource.CloudDrive -> GalleryEmptyState(
                 "No CloudDrive media",
                 "Sign in to a CloudDrive or add images and videos outside this device's Sync backup.",
                 "Refresh",
-                { model.refresh(forceCloud = true) },
+                { model.ensureCloudLoaded(force = true) },
             )
             photos.isEmpty() -> GalleryEmptyState("No media here yet", "New images and videos will appear automatically.", "Refresh") {
-                model.refresh(forceCloud = true)
+                model.refresh()
             }
             selectedFolder != null -> PhotoFolderPhotos(
                 photos = folderPhotos,
                 layout = layout,
+                listState = albumPhotosListState,
+                gridState = albumPhotosGridState,
+                selectedKeys = selectedKeySet,
+                selectionActive = selectedPhotos.isNotEmpty(),
+                onSelect = togglePhotoSelection,
                 onChromeVisibilityChanged = { chromeVisible = it },
             ) { media -> openMedia(media, folderPhotos, selectedFolder.name) }
             showFolders -> PhotoFolders(
                 folders = folders,
                 layout = layout,
+                listState = albumsListState,
+                gridState = albumsGridState,
                 onChromeVisibilityChanged = { chromeVisible = it },
             ) { folder ->
                 pageOrder = false
@@ -564,9 +974,108 @@ fun PhotosScreen(onNavigationVisibilityChanged: (Boolean) -> Unit = {}) {
             else -> PhotoTimeline(
                 photos = photos,
                 layout = layout,
+                listState = timelineListState,
+                gridState = timelineGridState,
+                selectedKeys = selectedKeySet,
+                selectionActive = selectedPhotos.isNotEmpty(),
+                onSelect = togglePhotoSelection,
                 onChromeVisibilityChanged = { chromeVisible = it },
             ) { media -> openMedia(media, photos, "All media") }
         }
+      }
+      SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter))
+    }
+
+    if (deleteSelection && selectedPhotos.isNotEmpty()) {
+        val cloud = source == BrowserSource.CloudDrive
+        AlertDialog(
+            onDismissRequest = { deleteSelection = false },
+            title = { Text(if (cloud || Build.VERSION.SDK_INT >= 30) "Move to Trash?" else "Delete permanently?") },
+            text = {
+                Text(
+                    if (cloud) "${selectedPhotos.size} selected ${if (selectedPhotos.size == 1) "item" else "items"} will move to CloudDrive Trash."
+                    else if (Build.VERSION.SDK_INT >= 30) "${selectedPhotos.size} selected ${if (selectedPhotos.size == 1) "item" else "items"} will move to the device Trash."
+                    else "Android 10 has no media Trash. The selected media will be permanently deleted.",
+                )
+            },
+            confirmButton = {
+                Button(onClick = {
+                    deleteSelection = false
+                    if (cloud) {
+                        selectedKeys = emptyList()
+                        model.deleteCloudPhotos(selectedPhotos)
+                    } else if (Build.VERSION.SDK_INT >= 30) {
+                        runCatching {
+                            val request = MediaStore.createTrashRequest(context.contentResolver, selectedPhotos.map(GalleryPhoto::uri), true)
+                            trashLauncher.launch(IntentSenderRequest.Builder(request.intentSender).build())
+                        }.onFailure { error -> scope.launch { snackbar.showSnackbar(error.message ?: "Could not request Trash access") } }
+                    } else {
+                        selectedKeys = emptyList()
+                        model.deleteDevicePhotos(selectedPhotos)
+                    }
+                }) { Text(if (cloud || Build.VERSION.SDK_INT >= 30) "Move to Trash" else "Delete") }
+            },
+            dismissButton = { TextButton(onClick = { deleteSelection = false }) { Text("Cancel") } },
+        )
+    }
+
+    if (moveSelection && selectedPhotos.isNotEmpty()) {
+        AlertDialog(
+            onDismissRequest = { moveSelection = false; newAlbumName = "" },
+            title = { Text("Move to Album") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OutlinedTextField(
+                        value = newAlbumName,
+                        onValueChange = { newAlbumName = it },
+                        label = { Text("New Album") },
+                        singleLine = true,
+                    )
+                    Text("Existing Albums", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (albumCandidates.isEmpty()) {
+                        Text("No other Albums", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    } else {
+                        LazyColumn(Modifier.fillMaxWidth().heightIn(max = 260.dp)) {
+                            listItems(albumCandidates, key = PhotoFolder::key) { album ->
+                                Column(
+                                    Modifier.fillMaxWidth().clickable {
+                                        moveSelection = false
+                                        newAlbumName = ""
+                                        val destination = album.photos.first()
+                                        if (source == BrowserSource.Device) {
+                                            moveDeviceSelection(destination.relativePath.ifBlank { "Pictures/${album.name}" })
+                                        } else {
+                                            selectedKeys = emptyList()
+                                            model.moveCloudPhotos(selectedPhotos, destination.cloudSegments.dropLast(1))
+                                        }
+                                    }.padding(vertical = 9.dp),
+                                ) {
+                                    Text(album.name, fontWeight = FontWeight.SemiBold)
+                                    Text(album.path, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val album = newAlbumName.trim()
+                        moveSelection = false
+                        newAlbumName = ""
+                        if (source == BrowserSource.Device) {
+                            moveDeviceSelection("Pictures/$album")
+                        } else {
+                            selectedKeys = emptyList()
+                            model.moveCloudPhotos(selectedPhotos, listOf(album))
+                        }
+                    },
+                    enabled = newAlbumName.trim().let { it.isNotBlank() && it != "." && it != ".." && '/' !in it && '\\' !in it },
+                ) { Text("Create and move") }
+            },
+            dismissButton = { OutlinedButton(onClick = { moveSelection = false; newAlbumName = "" }) { Text("Cancel") } },
+        )
     }
 
     viewerRequest?.let { request ->
@@ -587,6 +1096,35 @@ fun PhotosScreen(onNavigationVisibilityChanged: (Boolean) -> Unit = {}) {
 }
 
 @Composable
+private fun PhotoSelectionHeader(
+    count: Int,
+    moveEnabled: Boolean,
+    busy: Boolean,
+    onClose: () -> Unit,
+    onShare: () -> Unit,
+    onMove: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    Surface(color = MaterialTheme.colorScheme.secondaryContainer) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            IconButton(onClick = onClose, enabled = !busy) { Icon(Icons.Outlined.Close, "Clear selection") }
+            Text(
+                "$count selected",
+                modifier = Modifier.weight(1f),
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSecondaryContainer,
+            )
+            IconButton(onClick = onShare, enabled = !busy) { Icon(Icons.Outlined.Share, "Share selected") }
+            IconButton(onClick = onMove, enabled = moveEnabled && !busy) { Icon(Icons.Outlined.DriveFileMove, "Move to Album") }
+            IconButton(onClick = onDelete, enabled = !busy) { Icon(Icons.Outlined.Delete, "Delete selected") }
+        }
+    }
+}
+
+@Composable
 private fun PhotoFolderHeader(
     folder: PhotoFolder,
     pageOrder: Boolean,
@@ -600,7 +1138,7 @@ private fun PhotoFolderHeader(
             Modifier.fillMaxWidth().padding(start = 4.dp, top = 8.dp, end = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Outlined.ArrowBack, "Back to folders") }
+            IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Outlined.ArrowBack, "Back to Albums") }
             Column(Modifier.weight(1f)) {
                 Text(folder.name, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Text(
@@ -647,43 +1185,52 @@ private fun PhotoLayoutMenu(layout: PhotoLayoutMode, onLayoutChanged: (PhotoLayo
 private fun PhotoTimeline(
     photos: List<GalleryPhoto>,
     layout: PhotoLayoutMode,
+    listState: LazyListState,
+    gridState: LazyGridState,
+    selectedKeys: Set<String>,
+    selectionActive: Boolean,
+    onSelect: (GalleryPhoto) -> Unit,
     onChromeVisibilityChanged: (Boolean) -> Unit,
     onPhoto: (GalleryPhoto) -> Unit,
 ) {
     val grouped = remember(photos) { photos.groupBy { photoDay(it.takenAt) } }
     if (layout == PhotoLayoutMode.List) {
-        val state = rememberLazyListState()
-        ObservePhotoScroll(state, onChromeVisibilityChanged)
+        ObservePhotoScroll(listState, layout, onChromeVisibilityChanged)
         LazyColumn(
-            state = state,
+            state = listState,
             modifier = Modifier.fillMaxSize(),
             contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 6.dp),
         ) {
             grouped.forEach { (day, dayPhotos) ->
-                item(key = "day:$day") { PhotoDayHeading(day) }
-                listItems(dayPhotos, key = GalleryPhoto::key) { photo -> PhotoListRow(photo, onPhoto) }
+                item(key = "day:$day", contentType = "day-heading") { PhotoDayHeading(day) }
+                listItems(dayPhotos, key = GalleryPhoto::key, contentType = { "photo-row" }) { photo ->
+                    PhotoListRow(photo, photo.key in selectedKeys, selectionActive, onSelect, onPhoto)
+                }
             }
         }
         return
     }
-    val state = rememberLazyGridState()
-    ObservePhotoScroll(state, onChromeVisibilityChanged)
+    ObservePhotoScroll(gridState, layout, onChromeVisibilityChanged)
     LazyVerticalGrid(
         columns = photoGridCells(layout),
-        state = state,
+        state = gridState,
         modifier = Modifier.fillMaxSize(),
         contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 6.dp, top = 5.dp, end = 6.dp, bottom = 16.dp),
         horizontalArrangement = Arrangement.spacedBy(photoGridSpacing(layout)),
         verticalArrangement = Arrangement.spacedBy(photoGridSpacing(layout)),
     ) {
         grouped.forEach { (day, dayPhotos) ->
-            item(key = "day:$day", span = { GridItemSpan(maxLineSpan) }) {
+            item(key = "day:$day", span = { GridItemSpan(maxLineSpan) }, contentType = "day-heading") {
                 PhotoDayHeading(day)
             }
-            items(dayPhotos, key = GalleryPhoto::key) { photo ->
-                GalleryPhotoImage(
+            items(dayPhotos, key = GalleryPhoto::key, contentType = { "photo-tile" }) { photo ->
+                SelectablePhotoTile(
                     photo = photo,
-                    modifier = Modifier.fillMaxWidth().aspectRatio(1f).clickable { onPhoto(photo) },
+                    modifier = Modifier.fillMaxWidth().aspectRatio(1f),
+                    selected = photo.key in selectedKeys,
+                    selectionActive = selectionActive,
+                    onSelect = { onSelect(photo) },
+                    onOpen = { onPhoto(photo) },
                 )
             }
         }
@@ -694,32 +1241,34 @@ private fun PhotoTimeline(
 private fun PhotoFolders(
     folders: List<PhotoFolder>,
     layout: PhotoLayoutMode,
+    listState: LazyListState,
+    gridState: LazyGridState,
     onChromeVisibilityChanged: (Boolean) -> Unit,
     onFolder: (PhotoFolder) -> Unit,
 ) {
     if (layout == PhotoLayoutMode.List) {
-        val state = rememberLazyListState()
-        ObservePhotoScroll(state, onChromeVisibilityChanged)
+        ObservePhotoScroll(listState, layout, onChromeVisibilityChanged)
         LazyColumn(
-            state = state,
+            state = listState,
             modifier = Modifier.fillMaxSize(),
             contentPadding = androidx.compose.foundation.layout.PaddingValues(8.dp),
         ) {
-            listItems(folders, key = PhotoFolder::key) { folder -> PhotoFolderListRow(folder, onFolder) }
+            listItems(folders, key = PhotoFolder::key, contentType = { "folder-row" }) { folder ->
+                PhotoFolderListRow(folder, onFolder)
+            }
         }
         return
     }
-    val state = rememberLazyGridState()
-    ObservePhotoScroll(state, onChromeVisibilityChanged)
+    ObservePhotoScroll(gridState, layout, onChromeVisibilityChanged)
     LazyVerticalGrid(
         columns = folderGridCells(layout),
-        state = state,
+        state = gridState,
         modifier = Modifier.fillMaxSize(),
         contentPadding = androidx.compose.foundation.layout.PaddingValues(10.dp),
         horizontalArrangement = Arrangement.spacedBy(10.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        items(folders, key = PhotoFolder::key) { folder ->
+        items(folders, key = PhotoFolder::key, contentType = { "folder-card" }) { folder ->
             PhotoFolderCard(folder, onFolder)
         }
     }
@@ -729,35 +1278,44 @@ private fun PhotoFolders(
 private fun PhotoFolderPhotos(
     photos: List<GalleryPhoto>,
     layout: PhotoLayoutMode,
+    listState: LazyListState,
+    gridState: LazyGridState,
+    selectedKeys: Set<String>,
+    selectionActive: Boolean,
+    onSelect: (GalleryPhoto) -> Unit,
     onChromeVisibilityChanged: (Boolean) -> Unit,
     onPhoto: (GalleryPhoto) -> Unit,
 ) {
     if (layout == PhotoLayoutMode.List) {
-        val state = rememberLazyListState()
-        ObservePhotoScroll(state, onChromeVisibilityChanged)
+        ObservePhotoScroll(listState, layout, onChromeVisibilityChanged)
         LazyColumn(
-            state = state,
+            state = listState,
             modifier = Modifier.fillMaxSize(),
             contentPadding = androidx.compose.foundation.layout.PaddingValues(8.dp),
         ) {
-            listItems(photos, key = GalleryPhoto::key) { photo -> PhotoListRow(photo, onPhoto) }
+            listItems(photos, key = GalleryPhoto::key, contentType = { "photo-row" }) { photo ->
+                PhotoListRow(photo, photo.key in selectedKeys, selectionActive, onSelect, onPhoto)
+            }
         }
         return
     }
-    val state = rememberLazyGridState()
-    ObservePhotoScroll(state, onChromeVisibilityChanged)
+    ObservePhotoScroll(gridState, layout, onChromeVisibilityChanged)
     LazyVerticalGrid(
         columns = photoGridCells(layout),
-        state = state,
+        state = gridState,
         modifier = Modifier.fillMaxSize(),
         contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 6.dp, top = 4.dp, end = 6.dp, bottom = 16.dp),
         horizontalArrangement = Arrangement.spacedBy(photoGridSpacing(layout)),
         verticalArrangement = Arrangement.spacedBy(photoGridSpacing(layout)),
     ) {
-        items(photos, key = GalleryPhoto::key) { photo ->
-            GalleryPhotoImage(
+        items(photos, key = GalleryPhoto::key, contentType = { "photo-tile" }) { photo ->
+            SelectablePhotoTile(
                 photo = photo,
-                modifier = Modifier.fillMaxWidth().aspectRatio(1f).clickable { onPhoto(photo) },
+                modifier = Modifier.fillMaxWidth().aspectRatio(1f),
+                selected = photo.key in selectedKeys,
+                selectionActive = selectionActive,
+                onSelect = { onSelect(photo) },
+                onOpen = { onPhoto(photo) },
             )
         }
     }
@@ -773,10 +1331,25 @@ private fun PhotoDayHeading(day: String) {
     )
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun PhotoListRow(photo: GalleryPhoto, onPhoto: (GalleryPhoto) -> Unit) {
+private fun PhotoListRow(
+    photo: GalleryPhoto,
+    selected: Boolean,
+    selectionActive: Boolean,
+    onSelect: (GalleryPhoto) -> Unit,
+    onPhoto: (GalleryPhoto) -> Unit,
+) {
     Row(
-        Modifier.fillMaxWidth().clickable { onPhoto(photo) }.padding(horizontal = 4.dp, vertical = 6.dp),
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(if (selected) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent)
+            .combinedClickable(
+                onClick = { if (selectionActive) onSelect(photo) else onPhoto(photo) },
+                onLongClick = { onSelect(photo) },
+            )
+            .padding(horizontal = 4.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         GalleryPhotoImage(photo, Modifier.size(76.dp).clip(RoundedCornerShape(13.dp)))
@@ -798,6 +1371,36 @@ private fun PhotoListRow(photo: GalleryPhoto, onPhoto: (GalleryPhoto) -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontSize = 11.sp,
             )
+        }
+        if (selected) Icon(Icons.Outlined.Check, "Selected", tint = MaterialTheme.colorScheme.primary)
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun SelectablePhotoTile(
+    photo: GalleryPhoto,
+    modifier: Modifier,
+    selected: Boolean,
+    selectionActive: Boolean,
+    onSelect: () -> Unit,
+    onOpen: () -> Unit,
+) {
+    Box(
+        modifier
+            .clip(RoundedCornerShape(5.dp))
+            .combinedClickable(onClick = { if (selectionActive) onSelect() else onOpen() }, onLongClick = onSelect),
+    ) {
+        GalleryPhotoImage(photo, Modifier.fillMaxSize())
+        if (selected) {
+            Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.primary.copy(alpha = .24f)))
+            Surface(
+                modifier = Modifier.align(Alignment.TopEnd).padding(6.dp),
+                shape = RoundedCornerShape(18.dp),
+                color = MaterialTheme.colorScheme.primary,
+            ) {
+                Icon(Icons.Outlined.Check, "Selected", Modifier.padding(5.dp).size(18.dp), tint = MaterialTheme.colorScheme.onPrimary)
+            }
         }
     }
 }
@@ -861,19 +1464,21 @@ private fun folderGridCells(layout: PhotoLayoutMode): GridCells = GridCells.Adap
 private fun photoGridSpacing(layout: PhotoLayoutMode) = if (layout == PhotoLayoutMode.LargeGrid) 6.dp else 3.dp
 
 @Composable
-private fun ObservePhotoScroll(state: LazyGridState, onChromeVisibilityChanged: (Boolean) -> Unit) {
+private fun ObservePhotoScroll(state: LazyGridState, resetKey: Any?, onChromeVisibilityChanged: (Boolean) -> Unit) {
     ObservePhotoScrollPosition(
         key = state,
-        position = { state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset },
+        resetKey = resetKey,
+        position = { Triple(state.firstVisibleItemIndex, state.firstVisibleItemScrollOffset, state.isScrollInProgress) },
         onChromeVisibilityChanged = onChromeVisibilityChanged,
     )
 }
 
 @Composable
-private fun ObservePhotoScroll(state: LazyListState, onChromeVisibilityChanged: (Boolean) -> Unit) {
+private fun ObservePhotoScroll(state: LazyListState, resetKey: Any?, onChromeVisibilityChanged: (Boolean) -> Unit) {
     ObservePhotoScrollPosition(
         key = state,
-        position = { state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset },
+        resetKey = resetKey,
+        position = { Triple(state.firstVisibleItemIndex, state.firstVisibleItemScrollOffset, state.isScrollInProgress) },
         onChromeVisibilityChanged = onChromeVisibilityChanged,
     )
 }
@@ -881,17 +1486,28 @@ private fun ObservePhotoScroll(state: LazyListState, onChromeVisibilityChanged: 
 @Composable
 private fun ObservePhotoScrollPosition(
     key: Any,
-    position: () -> Pair<Int, Int>,
+    resetKey: Any?,
+    position: () -> Triple<Int, Int, Boolean>,
     onChromeVisibilityChanged: (Boolean) -> Unit,
 ) {
     val currentCallback by rememberUpdatedState(onChromeVisibilityChanged)
-    LaunchedEffect(key) {
+    val density = androidx.compose.ui.platform.LocalDensity.current
+    LaunchedEffect(key, resetKey, density) {
+        val hideThreshold = with(density) { 52.dp.roundToPx() }
+        val showThreshold = with(density) { 36.dp.roundToPx() }
         var previous = position()
         var direction = 0
         var travel = 0
+        var visible = true
         snapshotFlow { position() }.collect { current ->
             if (current.first == 0 && current.second <= 4) {
-                currentCallback(true)
+                if (!visible) {
+                    visible = true
+                    currentCallback(true)
+                }
+                direction = 0
+                travel = 0
+            } else if (!current.third) {
                 direction = 0
                 travel = 0
             } else {
@@ -907,9 +1523,18 @@ private fun ObservePhotoScrollPosition(
                         direction = nextDirection
                         travel = 0
                     }
-                    travel += if (current.first == previous.first) abs(current.second - previous.second) else 32
-                    if (travel >= 20) {
-                        currentCallback(direction < 0)
+                    travel += if (current.first == previous.first) {
+                        abs(current.second - previous.second)
+                    } else {
+                        hideThreshold
+                    }
+                    val threshold = if (direction > 0) hideThreshold else showThreshold
+                    if (travel >= threshold) {
+                        val nextVisible = direction < 0
+                        if (visible != nextVisible) {
+                            visible = nextVisible
+                            currentCallback(nextVisible)
+                        }
                         travel = 0
                     }
                 }
@@ -931,22 +1556,19 @@ private fun GalleryPhotoImage(photo: GalleryPhoto, modifier: Modifier) {
                         photo.requestHeaders.forEach { (name, value) -> set(name, value) }
                     }.build())
                 }
-            }.crossfade(false).build()
+            }.allowRgb565(true).crossfade(false).build()
         }
     }
     Box(modifier.background(MaterialTheme.colorScheme.surfaceVariant)) {
         if (request == null) {
             PhotoPlaceholder(photo.isVideo)
         } else {
-            SubcomposeAsyncImage(
+            AsyncImage(
                 model = request,
                 imageLoader = CloudDriveImageLoader.get(context),
                 contentDescription = photo.name,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize(),
-                loading = { PhotoPlaceholder(photo.isVideo) },
-                error = { PhotoPlaceholder(photo.isVideo) },
-                success = { SubcomposeAsyncImageContent() },
             )
         }
         if (photo.isVideo) {
@@ -1138,6 +1760,27 @@ private fun buildPhotoFolders(photos: List<GalleryPhoto>): List<PhotoFolder> = p
     }
     .sortedByDescending { folder -> folder.photos.firstOrNull()?.takenAt ?: 0L }
 
+private val photoNewestComparator = compareByDescending<GalleryPhoto> { it.takenAt }.thenBy(GalleryPhoto::key)
+
+private fun mergeNewestPhotos(current: List<GalleryPhoto>, added: List<GalleryPhoto>): List<GalleryPhoto> {
+    if (added.isEmpty()) return current
+    val incoming = added.sortedWith(photoNewestComparator)
+    if (current.isEmpty()) return incoming
+    val merged = ArrayList<GalleryPhoto>(current.size + incoming.size)
+    var currentIndex = 0
+    var incomingIndex = 0
+    while (currentIndex < current.size && incomingIndex < incoming.size) {
+        if (photoNewestComparator.compare(current[currentIndex], incoming[incomingIndex]) <= 0) {
+            merged += current[currentIndex++]
+        } else {
+            merged += incoming[incomingIndex++]
+        }
+    }
+    while (currentIndex < current.size) merged += current[currentIndex++]
+    while (incomingIndex < incoming.size) merged += incoming[incomingIndex++]
+    return merged
+}
+
 private val photoPageComparator = Comparator<GalleryPhoto> { left, right ->
     naturalNameCompare(left.name, right.name).takeIf { it != 0 } ?: left.key.compareTo(right.key)
 }
@@ -1154,6 +1797,9 @@ private fun BrowserEntry.isGalleryVideo(): Boolean = mimeType.startsWith("video/
 private val GALLERY_VIDEO_EXTENSIONS = setOf("mp4", "mkv", "webm", "mov", "avi", "m4v", "3gp")
 private val GALLERY_MEDIA_EXTENSIONS = setOf("jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif", "avif") + GALLERY_VIDEO_EXTENSIONS
 private const val CLOUD_MEDIA_REFRESH_MILLIS = 60_000L
+private const val CLOUD_MEDIA_BATCH_SIZE = 256
+private const val CLOUD_MEDIA_UI_BATCH_SIZE = 1_024
+private val DEVICE_MEDIA_RETRY_DELAYS = longArrayOf(750L, 1_500L, 3_000L, 6_000L)
 
 private val naturalNameParts = Regex("\\d+|\\D+")
 

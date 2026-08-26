@@ -9,6 +9,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     private var messageLaunch by mutableStateOf<MessageLaunch?>(null)
@@ -16,7 +19,6 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         handleIntent(intent)
-        AppSettings.schedule(this)
         setContent {
             var theme by remember { mutableStateOf(AppSettings.theme(this@MainActivity)) }
             CloudDriveTheme(darkTheme = theme == ThemeMode.Dark) {
@@ -29,6 +31,9 @@ class MainActivity : ComponentActivity() {
                     messageLaunch = messageLaunch,
                 )
             }
+        }
+        lifecycleScope.launch(Dispatchers.IO) {
+            AppSettings.schedule(applicationContext)
         }
     }
 

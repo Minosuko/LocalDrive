@@ -35,6 +35,10 @@ class SmsDeliverReceiver : BroadcastReceiver() {
                 val address = first.displayOriginatingAddress ?: first.originatingAddress.orEmpty()
                 val body = messages.joinToString("") { it.displayMessageBody ?: it.messageBody.orEmpty() }
                 val subscriptionId = intent.subscriptionId()
+                if (SmsBlocklistStore.isBlocked(context, address, subscriptionId)) {
+                    pending.resultCode = Telephony.Sms.Intents.RESULT_SMS_HANDLED
+                    return@execute
+                }
                 val values = ContentValues().apply {
                     put(Telephony.Sms.ADDRESS, address)
                     put(Telephony.Sms.BODY, body)
@@ -56,7 +60,7 @@ class SmsDeliverReceiver : BroadcastReceiver() {
                     null,
                     null,
                 )?.use { cursor -> if (cursor.moveToFirst()) cursor.getLong(0) else 0L } ?: 0L
-                MessageNotifier.postSms(context, address, body, threadId)
+                MessageNotifier.postSms(context, address, body, threadId, subscriptionId)
                 pending.resultCode = Telephony.Sms.Intents.RESULT_SMS_HANDLED
             } catch (_: Exception) {
                 pending.resultCode = Telephony.Sms.Intents.RESULT_SMS_GENERIC_ERROR
@@ -111,14 +115,15 @@ class RespondViaMessageService : Service() {
 }
 
 object SmsTransport {
-    fun send(context: Context, address: String, body: String): QueuedSms {
+    fun send(context: Context, address: String, body: String, preferredSubscriptionId: Int? = null): QueuedSms {
         require(hasSmsRole(context)) { "Make CloudDrive the default SMS app before sending" }
         val recipient = address.trim()
         val text = body.trim()
         require(recipient.isNotEmpty()) { "Enter a recipient" }
         require(text.isNotEmpty()) { "Enter a message" }
         val threadId = Telephony.Threads.getOrCreateThreadId(context, recipient)
-        val subscriptionId = SmsManager.getDefaultSmsSubscriptionId().takeIf { it >= 0 }
+        val subscriptionId = preferredSubscriptionId?.takeIf { it >= 0 }
+            ?: SmsManager.getDefaultSmsSubscriptionId().takeIf { it >= 0 }
         val values = ContentValues().apply {
             put(Telephony.Sms.ADDRESS, recipient)
             put(Telephony.Sms.BODY, text)

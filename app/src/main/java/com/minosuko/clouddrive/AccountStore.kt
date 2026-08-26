@@ -112,6 +112,7 @@ private class CloudDriveDatabase(context: Context) : SQLiteOpenHelper(context, "
 
 private object SessionCipher {
     private const val KEY_ALIAS = "clouddrive-session-v1"
+    @Volatile private var cachedKey: SecretKey? = null
 
     fun encrypt(value: String): String {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
@@ -135,32 +136,48 @@ private object SessionCipher {
     }
 
     private fun secretKey(): SecretKey {
-        val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-        (keyStore.getKey(KEY_ALIAS, null) as? SecretKey)?.let { return it }
-        return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore").apply {
-            init(
-                KeyGenParameterSpec.Builder(
-                    KEY_ALIAS,
-                    KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
-                )
-                    .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-                    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-                    .setRandomizedEncryptionRequired(true)
-                    .build(),
-            )
-        }.generateKey()
+        cachedKey?.let { return it }
+        return synchronized(this) {
+            cachedKey ?: run {
+                val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+                (keyStore.getKey(KEY_ALIAS, null) as? SecretKey) ?: KeyGenerator
+                    .getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+                    .apply {
+                        init(
+                            KeyGenParameterSpec.Builder(
+                                KEY_ALIAS,
+                                KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
+                            )
+                                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                                .setRandomizedEncryptionRequired(true)
+                                .build(),
+                        )
+                    }
+                    .generateKey()
+            }.also { cachedKey = it }
+        }
     }
 }
 
 object AccountStore {
     private val refreshLocks = ConcurrentHashMap<String, Any>()
+    private val sessionCache = ConcurrentHashMap<String, StoredSession>()
+    private val accountCache = ConcurrentHashMap<String, CloudAccount>()
+    @Volatile private var accountsCache: List<CloudAccount>? = null
     @Volatile private var database: CloudDriveDatabase? = null
 
-    fun hasSession(context: Context, profileId: String): Boolean = read(context, profileId)?.account?.role == "root"
+    fun hasSession(context: Context, profileId: String): Boolean = account(context, profileId) != null
 
-    fun account(context: Context, profileId: String): CloudAccount? = read(context, profileId)?.account?.takeIf { it.role == "root" }
+    fun account(context: Context, profileId: String): CloudAccount? {
+        accountCache[profileId]?.let { return it.takeIf { account -> account.role == "root" } }
+        val account = readAccount(context, profileId) ?: return null
+        accountCache[profileId] = account
+        return account.takeIf { it.role == "root" }
+    }
 
     fun accounts(context: Context): List<CloudAccount> {
+        accountsCache?.let { return it }
         val result = mutableListOf<CloudAccount>()
         db(context).readableDatabase.query(
             "server_sessions",
@@ -180,10 +197,11 @@ object AccountStore {
                     cursor.getString(4),
                     cursor.getString(5),
                 )
+                accountCache[account.profileId] = account
                 if (account.role == "root") result += account
             }
         }
-        return result
+        return result.also { accountsCache = it }
     }
 
     fun save(context: Context, profileId: String, serverOrigin: String, session: AccountSession) {
@@ -206,10 +224,30 @@ object AccountStore {
             values,
             SQLiteDatabase.CONFLICT_REPLACE,
         )
+        val account = CloudAccount(
+            profileId,
+            serverOrigin,
+            session.userId,
+            session.username,
+            session.displayName,
+            session.role,
+        )
+        accountCache[profileId] = account
+        sessionCache[profileId] = StoredSession(
+            account,
+            session.accessToken,
+            session.accessExpiresAt,
+            session.refreshToken,
+            session.refreshExpiresAt,
+        )
+        accountsCache = null
     }
 
     fun remove(context: Context, profileId: String) {
         db(context).writableDatabase.delete("server_sessions", "profile_id = ?", arrayOf(profileId))
+        sessionCache.remove(profileId)
+        accountCache.remove(profileId)
+        accountsCache = null
     }
 
     fun saveIncomingMms(context: Context, data: ByteArray, mimeType: String, subscriptionId: Int?): Long {
@@ -273,7 +311,9 @@ object AccountStore {
         }
     }
 
-    private fun read(context: Context, profileId: String): StoredSession? = runCatching {
+    private fun read(context: Context, profileId: String): StoredSession? {
+        sessionCache[profileId]?.let { return it }
+        return runCatching {
         db(context).readableDatabase.query(
             "server_sessions",
             arrayOf(
@@ -300,12 +340,31 @@ object AccountStore {
                 accessExpiresAt = cursor.getLong(6),
                 refreshToken = SessionCipher.decrypt(cursor.getString(7)),
                 refreshExpiresAt = cursor.getLong(8),
-            )
+            ).also { session ->
+                sessionCache[profileId] = session
+                accountCache[profileId] = session.account
+            }
         }
-    }.getOrElse {
-        remove(context, profileId)
-        null
+        }.getOrElse {
+            remove(context, profileId)
+            null
+        }
     }
+
+    private fun readAccount(context: Context, profileId: String): CloudAccount? = runCatching {
+        db(context).readableDatabase.query(
+            "server_sessions",
+            arrayOf("server_origin", "user_id", "username", "display_name", "role"),
+            "profile_id = ?",
+            arrayOf(profileId),
+            null,
+            null,
+            null,
+        ).use { cursor ->
+            if (!cursor.moveToFirst()) return@use null
+            CloudAccount(profileId, cursor.getString(0), cursor.getString(1), cursor.getString(2), cursor.getString(3), cursor.getString(4))
+        }
+    }.getOrNull()
 
     private fun db(context: Context): CloudDriveDatabase = database ?: synchronized(this) {
         database ?: CloudDriveDatabase(context.applicationContext).also { database = it }

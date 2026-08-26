@@ -34,6 +34,7 @@ object AppSettings {
     private const val KEY_THEME = "theme"
     private const val KEY_DEVICE_TREE = "device_tree"
     private const val KEY_PHOTO_LAYOUT = "photo_layout"
+    private const val KEY_SERVER_STORAGE_PREFIX = "server_storage_"
     const val PERIODIC_WORK = "cloud_drive_media_sync_periodic"
     const val MANUAL_WORK = "cloud_drive_media_sync_manual"
 
@@ -73,6 +74,7 @@ object AppSettings {
 
     fun removeDrive(context: Context, id: String) {
         saveDrives(context, drives(context).filterNot { it.id == id })
+        preferences(context).edit().remove(KEY_SERVER_STORAGE_PREFIX + id).apply()
         if (syncDriveId(context) == id) preferences(context).edit().remove(KEY_SYNC_DRIVE).apply()
     }
 
@@ -143,6 +145,27 @@ object AppSettings {
 
     fun savePhotoLayout(context: Context, layout: PhotoLayoutMode) {
         preferences(context).edit().putString(KEY_PHOTO_LAYOUT, layout.name).apply()
+    }
+
+    fun cachedServerStorage(context: Context, drive: DriveProfile): StorageStats? = runCatching {
+        val stored = preferences(context).getString(KEY_SERVER_STORAGE_PREFIX + drive.id, null) ?: return@runCatching null
+        val json = JSONObject(stored)
+        if (json.optString("address") != drive.address) return@runCatching null
+        StorageStats(
+            used = json.getLong("used"),
+            free = json.getLong("free"),
+            total = json.getLong("total"),
+        )
+    }.getOrNull()
+
+    fun saveServerStorage(context: Context, drive: DriveProfile, storage: StorageStats) {
+        val json = JSONObject()
+            .put("address", drive.address)
+            .put("used", storage.used)
+            .put("free", storage.free)
+            .put("total", storage.total)
+            .put("saved_at", System.currentTimeMillis())
+        preferences(context).edit().putString(KEY_SERVER_STORAGE_PREFIX + drive.id, json.toString()).apply()
     }
 
     fun deviceTree(context: Context): String? = preferences(context).getString(KEY_DEVICE_TREE, null)

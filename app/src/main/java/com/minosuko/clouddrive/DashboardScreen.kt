@@ -54,7 +54,7 @@ fun DashboardScreen() {
             item { ProductCard { Text("No CloudDrives", fontWeight = FontWeight.SemiBold); Text("Add one from the Files tab.", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp) } }
         }
         items(state.cloudStorage, key = { it.drive.id }) { cloud ->
-            StorageUsageCard(cloud.drive.name, cloud.storage, Icons.Outlined.Cloud, cloud.error ?: "Server unavailable")
+            StorageUsageCard(cloud.drive.name, cloud.storage, Icons.Outlined.Cloud, cloud.error ?: if (state.loading) "Connecting..." else "Server unavailable")
         }
     }
 }

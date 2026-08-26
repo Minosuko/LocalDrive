@@ -1,11 +1,19 @@
 package com.minosuko.clouddrive
 
 import android.Manifest
+import android.content.ActivityNotFoundException
+import android.content.Intent
+import android.net.Uri
 import android.os.Build
+import android.provider.Settings
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -40,8 +48,10 @@ import androidx.compose.material.icons.outlined.GridView
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.LinkOff
 import androidx.compose.material.icons.outlined.MoreVert
+import androidx.compose.material.icons.outlined.OpenInNew
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.UploadFile
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -61,11 +71,13 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -85,6 +97,7 @@ import coil.request.ImageRequest
 import okhttp3.Headers
 import coil.request.videoFrameMillis
 import java.io.File
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -107,8 +120,11 @@ fun ProductFilesScreen() {
     var signInAttempted by remember { mutableStateOf(false) }
     var disconnectDriveId by remember { mutableStateOf<String?>(null) }
     var infoEntry by remember { mutableStateOf<BrowserEntry?>(null) }
-    var deleteEntry by remember { mutableStateOf<BrowserEntry?>(null) }
+    var deleteEntries by remember { mutableStateOf<List<BrowserEntry>?>(null) }
+    var pasteConflictPrompt by remember { mutableStateOf(false) }
     var trashDriveId by remember { mutableStateOf<String?>(null) }
+    var pendingInstaller by remember { mutableStateOf<PreparedExternalFile?>(null) }
+    val scope = rememberCoroutineScope()
     val thumbnailLoader = remember(context.applicationContext) { CloudDriveImageLoader.get(context) }
     val visibleItems = remember(state.items, state.query, state.sort) { state.visibleItems }
     val currentLocation = remember(state.source, state.activeDriveId, state.cloudPath, state.deviceStack, state.drives) {
@@ -134,6 +150,14 @@ fun ProductFilesScreen() {
                     state.clipboard?.entry?.cloudSegments?.dropLast(1) != state.cloudPath))
         BrowserSource.Device -> state.deviceStack.isNotEmpty()
     }
+    val canGoUp = if (state.source == BrowserSource.CloudDrive) state.activeDriveId != null else state.deviceStack.size > 1
+    val selectedEntries = state.selectedItems
+    val conflictNames = state.clipboard?.entries.orEmpty().map(BrowserEntry::name).toSet()
+        .intersect(state.items.mapTo(hashSetOf(), BrowserEntry::name))
+    BackHandler(
+        enabled = (selectedEntries.isNotEmpty() || canGoUp) && state.viewer == null && state.imageViewer == null && state.archiveViewer == null,
+        onBack = { if (selectedEntries.isNotEmpty()) model.clearSelection() else model.up() },
+    )
 
     val allFilesLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
         if (hasDeviceFileAccess(context)) model.enableDeviceRoot()
@@ -144,10 +168,46 @@ fun ProductFilesScreen() {
     val uploadLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (uris.isNotEmpty()) model.upload(uris)
     }
+    val installPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        val installer = pendingInstaller
+        pendingInstaller = null
+        if (installer != null) {
+            if (Build.VERSION.SDK_INT < 26 || context.packageManager.canRequestPackageInstalls()) {
+                runCatching { context.startActivity(externalOpenIntent(installer)) }
+                    .onFailure { scope.launch { snackbar.showSnackbar(it.message ?: "Could not open package installer") } }
+            } else {
+                scope.launch { snackbar.showSnackbar("Allow installs from CloudDrive Sync to install this APK") }
+            }
+        }
+    }
 
     LaunchedEffect(Unit) { model.reloadDrives() }
     LaunchedEffect(state.message) {
         state.message?.let { snackbar.showSnackbar(it); model.consumeMessage() }
+    }
+    LaunchedEffect(state.externalOpen?.id) {
+        val file = state.externalOpen ?: return@LaunchedEffect
+        try {
+            if (file.installPackage && Build.VERSION.SDK_INT >= 26 && !context.packageManager.canRequestPackageInstalls()) {
+                pendingInstaller = file
+                installPermissionLauncher.launch(
+                    Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}")),
+                )
+            } else if (file.installPackage) {
+                context.startActivity(externalOpenIntent(file))
+            } else {
+                val chooser = Intent.createChooser(externalOpenIntent(file), "Open with").apply {
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                context.startActivity(chooser)
+            }
+        } catch (error: ActivityNotFoundException) {
+            snackbar.showSnackbar(if (file.installPackage) "No package installer is available" else "No app can open this file")
+        } catch (error: SecurityException) {
+            snackbar.showSnackbar(error.message ?: "Opening this file is not allowed")
+        } finally {
+            model.consumeExternalOpen()
+        }
     }
 
     Scaffold(
@@ -162,7 +222,11 @@ fun ProductFilesScreen() {
                         ) {
                             Column(Modifier.weight(1f)) {
                                 Text(
-                                    "${if (clipboard.action == ClipboardAction.Cut) "Move" else "Copy"} ${clipboard.entry.name}",
+                                    if (clipboard.entries.size == 1) {
+                                        "${if (clipboard.action == ClipboardAction.Cut) "Move" else "Copy"} ${clipboard.entry.name}"
+                                    } else {
+                                        "${if (clipboard.action == ClipboardAction.Cut) "Move" else "Copy"} ${clipboard.entries.size} items"
+                                    },
                                     fontWeight = FontWeight.SemiBold,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis,
@@ -177,7 +241,13 @@ fun ProductFilesScreen() {
                                 )
                             }
                             IconButton(onClick = model::clearClipboard, enabled = !state.operationRunning) { Icon(Icons.Outlined.Close, "Cancel paste") }
-                            Button(onClick = model::paste, enabled = canPaste && !state.operationRunning) {
+                            Button(
+                                onClick = {
+                                    if (conflictNames.isEmpty()) model.paste(FileConflictPolicy.Overwrite)
+                                    else pasteConflictPrompt = true
+                                },
+                                enabled = canPaste && !state.operationRunning,
+                            ) {
                                 Icon(Icons.Outlined.ContentPaste, null)
                                 Spacer(Modifier.size(4.dp))
                                 Text("Paste")
@@ -205,11 +275,40 @@ fun ProductFilesScreen() {
                 Tab(state.source == BrowserSource.CloudDrive, { model.setSource(BrowserSource.CloudDrive) }, text = { Text("CloudDrive", fontSize = 13.sp) })
             }
 
-            Row(
+            if (selectedEntries.isNotEmpty()) {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .background(MaterialTheme.colorScheme.secondaryContainer)
+                        .padding(horizontal = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    IconButton(onClick = model::clearSelection) { Icon(Icons.Outlined.Close, "Clear selection") }
+                    Text(
+                        "${selectedEntries.size} selected",
+                        modifier = Modifier.weight(1f),
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    )
+                    IconButton(onClick = { model.putClipboard(selectedEntries, ClipboardAction.Copy) }) {
+                        Icon(Icons.Outlined.ContentCopy, "Copy selected")
+                    }
+                    IconButton(onClick = { model.putClipboard(selectedEntries, ClipboardAction.Cut) }) {
+                        Icon(Icons.Outlined.ContentCut, "Move selected")
+                    }
+                    if (selectedEntries.size == 1) {
+                        IconButton(onClick = { infoEntry = selectedEntries.first() }) {
+                            Icon(Icons.Outlined.Info, "Selected item info")
+                        }
+                    }
+                    IconButton(onClick = { deleteEntries = selectedEntries }) {
+                        Icon(Icons.Outlined.Delete, "Delete selected")
+                    }
+                }
+            } else Row(
                 Modifier.fillMaxWidth().padding(start = 4.dp, end = 2.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                val canGoUp = if (state.source == BrowserSource.CloudDrive) state.activeDriveId != null else state.deviceStack.size > 1
                 if (canGoUp) IconButton(onClick = model::up) { Icon(Icons.AutoMirrored.Outlined.ArrowBack, "Up") }
                 Text(
                     currentLocation,
@@ -314,7 +413,9 @@ fun ProductFilesScreen() {
                 )
             }
 
-            if (state.loading || (state.operationRunning && state.transferProgress == null)) LinearProgressIndicator(Modifier.fillMaxWidth())
+            if (state.loading || state.archiveLoading || (state.operationRunning && state.transferProgress == null)) {
+                LinearProgressIndicator(Modifier.fillMaxWidth())
+            }
             when {
                 state.source == BrowserSource.Device && !hasDeviceFileAccess(context) -> FilesEmptyState(
                     "Device access required",
@@ -339,11 +440,15 @@ fun ProductFilesScreen() {
                         FileListRow(
                             entry,
                             thumbnailLoader,
+                            entry.id in state.selectedIds,
+                            selectedEntries.isNotEmpty(),
+                            { model.toggleSelection(entry) },
                             { model.open(entry) },
+                            { model.openWith(entry) },
                             { model.putClipboard(entry, it) },
                             { disconnectDriveId = entry.driveProfileId },
                             { infoEntry = entry },
-                            { deleteEntry = entry },
+                            { deleteEntries = listOf(entry) },
                         )
                     }
                 }
@@ -358,11 +463,15 @@ fun ProductFilesScreen() {
                         FileGridCard(
                             entry,
                             thumbnailLoader,
+                            entry.id in state.selectedIds,
+                            selectedEntries.isNotEmpty(),
+                            { model.toggleSelection(entry) },
                             { model.open(entry) },
+                            { model.openWith(entry) },
                             { model.putClipboard(entry, it) },
                             { disconnectDriveId = entry.driveProfileId },
                             { infoEntry = entry },
-                            { deleteEntry = entry },
+                            { deleteEntries = listOf(entry) },
                         )
                     }
                 }
@@ -434,6 +543,29 @@ fun ProductFilesScreen() {
             dismissButton = { OutlinedButton(onClick = { addDriveDialog = false }) { Text("Cancel") } },
         )
     }
+    signInDriveId?.let { profileId ->
+        val drive = state.drives.firstOrNull { it.id == profileId }
+        if (drive != null) {
+            CloudAccountSignInDialog(
+                driveName = drive.name,
+                busy = state.operationRunning,
+                error = state.error.takeIf { signInAttempted },
+                onDismiss = { signInDriveId = null; signInAttempted = false },
+                onSubmit = { username, password, root ->
+                    signInAttempted = true
+                    model.signInToDrive(profileId, username, password, root)
+                },
+            )
+            LaunchedEffect(profileId, activeAccount?.username) {
+                if (activeAccount != null && activeDrive?.id == profileId) {
+                    signInDriveId = null
+                    signInAttempted = false
+                }
+            }
+        } else {
+            LaunchedEffect(profileId) { signInDriveId = null }
+        }
+    }
 
     createDirectory?.let { directory ->
         AlertDialog(
@@ -482,36 +614,80 @@ fun ProductFilesScreen() {
             confirmButton = { Button(onClick = { infoEntry = null }) { Text("Close") } },
         )
     }
-    deleteEntry?.let { entry ->
-        val cloudEntry = entry.source == BrowserSource.CloudDrive
+    deleteEntries?.let { entries ->
+        val entry = entries.first()
+        val cloudEntry = entries.all { it.source == BrowserSource.CloudDrive }
+        val multiple = entries.size > 1
         AlertDialog(
-            onDismissRequest = { deleteEntry = null },
-            title = { Text(if (cloudEntry) "Move to Trash?" else "Delete ${if (entry.isDirectory) "folder" else "file"}?") },
+            onDismissRequest = { deleteEntries = null },
+            title = {
+                Text(
+                    if (cloudEntry) "Move to Trash?"
+                    else if (multiple) "Delete ${entries.size} items?"
+                    else "Delete ${if (entry.isDirectory) "folder" else "file"}?",
+                )
+            },
             text = {
                 Text(
-                    if (cloudEntry) "${entry.name} will move to CloudDrive Trash."
+                    if (cloudEntry) {
+                        if (multiple) "${entries.size} items will move to CloudDrive Trash."
+                        else "${entry.name} will move to CloudDrive Trash."
+                    }
+                    else if (multiple) "${entries.size} items will be permanently deleted, including the contents of selected folders."
                     else "${entry.name} will be permanently deleted${if (entry.isDirectory) " with everything inside it" else ""}.",
                 )
             },
             confirmButton = {
-                Button(onClick = { model.delete(entry); deleteEntry = null }) {
+                Button(onClick = { model.delete(entries); deleteEntries = null }) {
                     Icon(Icons.Outlined.Delete, null)
                     Spacer(Modifier.size(6.dp))
                     Text(if (cloudEntry) "Move to Trash" else "Delete")
                 }
             },
-            dismissButton = { OutlinedButton(onClick = { deleteEntry = null }) { Text("Cancel") } },
+            dismissButton = { OutlinedButton(onClick = { deleteEntries = null }) { Text("Cancel") } },
         )
     }
+    if (pasteConflictPrompt) {
+        AlertDialog(
+            onDismissRequest = { pasteConflictPrompt = false },
+            title = { Text(if (conflictNames.size == 1) "File already exists" else "Files already exist") },
+            text = {
+                Text(
+                    if (conflictNames.size == 1) "${conflictNames.first()} already exists in this folder."
+                    else "${conflictNames.size} selected names already exist in this folder.",
+                )
+            },
+            confirmButton = {
+                Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Button(onClick = { pasteConflictPrompt = false; model.paste(FileConflictPolicy.KeepNewer) }) {
+                        Text("Keep newer file")
+                    }
+                    OutlinedButton(onClick = { pasteConflictPrompt = false; model.paste(FileConflictPolicy.Overwrite) }) {
+                        Text("Overwrite")
+                    }
+                    TextButton(onClick = { pasteConflictPrompt = false; model.paste(FileConflictPolicy.Skip) }) {
+                        Text("Skip")
+                    }
+                }
+            },
+            dismissButton = { TextButton(onClick = { pasteConflictPrompt = false }) { Text("Cancel") } },
+        )
+    }
+    state.archiveViewer?.let { ArchiveTreeViewer(it, model::closeArchive) }
     state.imageViewer?.let { ImageGalleryViewer(it, thumbnailLoader, model::closeViewer) }
     state.viewer?.let { MediaViewer(it, thumbnailLoader, model::closeViewer) }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun FileListRow(
     entry: BrowserEntry,
     imageLoader: ImageLoader,
+    selected: Boolean,
+    selectionActive: Boolean,
+    select: () -> Unit,
     open: () -> Unit,
+    openWith: () -> Unit,
     clipboard: (ClipboardAction) -> Unit,
     disconnect: () -> Unit,
     info: () -> Unit,
@@ -519,26 +695,37 @@ private fun FileListRow(
 ) {
     var menu by remember { mutableStateOf(false) }
     Row(
-        Modifier.fillMaxWidth().clickable(onClick = open).padding(horizontal = 2.dp, vertical = 6.dp),
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(if (selected) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surface)
+            .combinedClickable(onClick = { if (selectionActive) select() else open() }, onLongClick = select)
+            .padding(horizontal = 2.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         FilePreview(entry, imageLoader, Modifier.size(40.dp))
         Spacer(Modifier.size(8.dp))
         Column(Modifier.weight(1f)) {
             Text(entry.name, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(if (entry.isDirectory) "Folder" else "${formatBytes(entry.size)}  ${formatModified(entry.modified)}", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)
+            Text(fileEntryDetail(entry, includeModified = true), color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)
         }
-        if (entry.driveRoot) DriveActionMenu(menu, { menu = it }, disconnect)
-        else FileActionMenu(menu, { menu = it }, clipboard, info, delete)
+        if (selected) Icon(Icons.Outlined.CheckCircle, "Selected", tint = MaterialTheme.colorScheme.primary)
+        else if (!selectionActive && entry.driveRoot) DriveActionMenu(menu, { menu = it }, disconnect)
+        else if (!selectionActive) FileActionMenu(menu, { menu = it }, !entry.isDirectory, openWith, clipboard, info, delete)
     }
     HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = .5f))
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun FileGridCard(
     entry: BrowserEntry,
     imageLoader: ImageLoader,
+    selected: Boolean,
+    selectionActive: Boolean,
+    select: () -> Unit,
     open: () -> Unit,
+    openWith: () -> Unit,
     clipboard: (ClipboardAction) -> Unit,
     disconnect: () -> Unit,
     info: () -> Unit,
@@ -546,22 +733,25 @@ private fun FileGridCard(
 ) {
     var menu by remember { mutableStateOf(false) }
     androidx.compose.material3.Card(
-        modifier = Modifier.clickable(onClick = open),
+        modifier = Modifier.combinedClickable(onClick = { if (selectionActive) select() else open() }, onLongClick = select),
         shape = RoundedCornerShape(16.dp),
-        colors = androidx.compose.material3.CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        colors = androidx.compose.material3.CardDefaults.cardColors(
+            containerColor = if (selected) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surface,
+        ),
         border = androidx.compose.material3.CardDefaults.outlinedCardBorder(),
     ) {
         Column(Modifier.padding(7.dp)) {
             Box {
                 FilePreview(entry, imageLoader, Modifier.fillMaxWidth().aspectRatio(1.25f))
                 Box(Modifier.align(Alignment.TopEnd)) {
-                    if (entry.driveRoot) DriveActionMenu(menu, { menu = it }, disconnect)
-                    else FileActionMenu(menu, { menu = it }, clipboard, info, delete)
+                    if (selected) Icon(Icons.Outlined.CheckCircle, "Selected", tint = MaterialTheme.colorScheme.primary)
+                    else if (!selectionActive && entry.driveRoot) DriveActionMenu(menu, { menu = it }, disconnect)
+                    else if (!selectionActive) FileActionMenu(menu, { menu = it }, !entry.isDirectory, openWith, clipboard, info, delete)
                 }
             }
             Spacer(Modifier.height(6.dp))
             Text(entry.name, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis, fontSize = 13.sp)
-            Text(if (entry.isDirectory) "Folder" else formatBytes(entry.size), color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp)
+            Text(fileEntryDetail(entry, includeModified = entry.isDirectory), color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp)
         }
     }
 }
@@ -605,6 +795,8 @@ private fun FilePreview(entry: BrowserEntry, imageLoader: ImageLoader, modifier:
 private fun FileActionMenu(
     expanded: Boolean,
     setExpanded: (Boolean) -> Unit,
+    canOpenWith: Boolean,
+    openWith: () -> Unit,
     action: (ClipboardAction) -> Unit,
     info: () -> Unit,
     delete: () -> Unit,
@@ -612,6 +804,14 @@ private fun FileActionMenu(
     Box {
         IconButton(onClick = { setExpanded(true) }) { Icon(Icons.Outlined.MoreVert, "Actions") }
         DropdownMenu(expanded, onDismissRequest = { setExpanded(false) }) {
+            if (canOpenWith) {
+                DropdownMenuItem(
+                    text = { Text("Open with") },
+                    leadingIcon = { Icon(Icons.Outlined.OpenInNew, null) },
+                    onClick = { setExpanded(false); openWith() },
+                )
+                HorizontalDivider()
+            }
             DropdownMenuItem(
                 text = { Text("Cut") },
                 leadingIcon = { Icon(Icons.Outlined.ContentCut, null) },
@@ -707,4 +907,9 @@ private fun transferDetail(progress: FileTransferProgress?, canPaste: Boolean, c
     } else {
         progress.label
     }
+}
+
+private fun fileEntryDetail(entry: BrowserEntry, includeModified: Boolean): String {
+    val type = if (entry.isDirectory) "Folder" else formatBytes(entry.size)
+    return if (includeModified && entry.modified > 0) "$type  ${formatModified(entry.modified)}" else type
 }
